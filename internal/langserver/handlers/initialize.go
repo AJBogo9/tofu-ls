@@ -101,6 +101,7 @@ func (svc *service) Initialize(ctx context.Context, params lsp.InitializeParams)
 	lsctx.SetExperimentalFeatures(ctx, out.Options.ExperimentalFeatures)
 	// set validation options for jobs
 	lsctx.SetValidationOptions(ctx, out.Options.Validation)
+	svc.inlayHints = out.Options.InlayHints
 
 	if len(out.UnusedKeys) > 0 {
 		jrpc2.ServerFromContext(ctx).Notify(ctx, "window/showMessage", &lsp.ShowMessageParams{
@@ -188,6 +189,7 @@ func initializeResult(ctx context.Context) lsp.InitializeResult {
 			CodeLensProvider:           &lsp.CodeLensOptions{},
 			ReferencesProvider:         true,
 			HoverProvider:              true,
+			InlayHintProvider:          true,
 			DocumentFormattingProvider: true,
 			DocumentSymbolProvider:     true,
 			WorkspaceSymbolProvider:    true,

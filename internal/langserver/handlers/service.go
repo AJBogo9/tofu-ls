@@ -84,6 +84,8 @@ type service struct {
 	walkerCollector    *walker.WalkerCollector
 	additionalHandlers rpch.Map
 
+	inlayHints settings.InlayHints
+
 	singleFileMode bool
 }
 
@@ -290,6 +292,14 @@ func (svc *service) Assigner() (jrpc2.Assigner, error) {
 			ctx = exec.WithExecutorFactory(ctx, svc.tfExecFactory)
 
 			return handle(ctx, req, svc.TextDocumentFormatting)
+		},
+		"textDocument/inlayHint": func(ctx context.Context, req *jrpc2.Request) (interface{}, error) {
+			err := session.CheckInitializationIsConfirmed()
+			if err != nil {
+				return nil, err
+			}
+
+			return handle(ctx, req, svc.TextDocumentInlayHint)
 		},
 		"textDocument/signatureHelp": func(ctx context.Context, req *jrpc2.Request) (interface{}, error) {
 			err := session.CheckInitializationIsConfirmed()

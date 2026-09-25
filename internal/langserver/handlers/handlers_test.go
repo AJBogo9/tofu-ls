@@ -69,6 +69,7 @@ func initializeResponse(t *testing.T, commandPrefix string) string {
 						"tokenModifiers": []
 					}
 				},
+				"inlayHintProvider": true,
 				"workspace": {
 					"workspaceFolders": {
 						"supported": true,
