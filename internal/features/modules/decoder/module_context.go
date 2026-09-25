@@ -9,9 +9,13 @@ import (
 	"github.com/hashicorp/hcl-lang/decoder"
 	"github.com/hashicorp/hcl-lang/reference"
 	"github.com/hashicorp/hcl/v2"
+	tfschema "github.com/opentofu/opentofu-schema/schema"
 	"github.com/opentofu/tofu-ls/internal/features/modules/ast"
 	"github.com/opentofu/tofu-ls/internal/features/modules/state"
 )
+
+// semanticHighlighting is read-only and shared by all module path contexts
+var semanticHighlighting = tfschema.SemanticHighlighting()
 
 func modulePathContext(mod *state.ModuleRecord, stateReader CombinedReader) (*decoder.PathContext, error) {
 	schema, err := schemaForModule(mod, stateReader)
@@ -30,6 +34,8 @@ func modulePathContext(mod *state.ModuleRecord, stateReader CombinedReader) (*de
 		Files:            make(map[string]*hcl.File, 0),
 		Functions:        functions,
 		Validators:       moduleValidators,
+
+		SemanticHighlighting: semanticHighlighting,
 	}
 
 	for _, origin := range mod.RefOrigins {

@@ -38,5 +38,6 @@ func mustCoreSchemaForVersion(v *version.Version) *schema.BodySchema {
 		// this should never happen
 		panic(err)
 	}
+	s = tfschema.WithMetaArgumentModifiers(s)
 	return s
 }

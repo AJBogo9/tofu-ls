@@ -553,3 +553,92 @@ func TestTokenEncoder_multiLineLocalWithInnerTokens(t *testing.T) {
 			expectedData, data, diff)
 	}
 }
+
+func TestTokenEncoder_referenceKindModifiers(t *testing.T) {
+	bytes := []byte(`attr = var.name`)
+	tokens := []lang.SemanticToken{
+		{
+			Type:      lang.TokenReferenceStep,
+			Modifiers: []lang.SemanticTokenModifier{"opentofu-variable", lang.TokenModifierKeywordStep},
+			Range: hcl.Range{
+				Filename: "test.tf",
+				Start:    hcl.Pos{Line: 1, Column: 8, Byte: 7},
+				End:      hcl.Pos{Line: 1, Column: 11, Byte: 10},
+			},
+		},
+		{
+			Type:      lang.TokenReferenceStep,
+			Modifiers: []lang.SemanticTokenModifier{"opentofu-variable", lang.TokenModifierNameStep},
+			Range: hcl.Range{
+				Filename: "test.tf",
+				Start:    hcl.Pos{Line: 1, Column: 12, Byte: 11},
+				End:      hcl.Pos{Line: 1, Column: 16, Byte: 15},
+			},
+		},
+	}
+
+	testCases := []struct {
+		name           string
+		tokenModifiers []string
+		expectedData   []uint32
+	}{
+		{
+			// a client that declares the kind and role modifiers;
+			// the legend is in server order: keywordStep, nameStep, variable
+			"declared",
+			[]string{"opentofu-variable", "hcl-keywordStep", "hcl-nameStep"},
+			[]uint32{
+				0, 7, 3, 0, 0b101,
+				0, 4, 4, 0, 0b110,
+			},
+		},
+		{
+			// an older client which only knows the type still gets the tokens
+			"undeclared",
+			[]string{},
+			[]uint32{
+				0, 7, 3, 0, 0,
+				0, 4, 4, 0, 0,
+			},
+		},
+		{
+			// the kind without roles
+			"kind only",
+			[]string{"opentofu-variable"},
+			[]uint32{
+				0, 7, 3, 0, 1,
+				0, 4, 4, 0, 1,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			te := &TokenEncoder{
+				Lines:  source.MakeSourceLines("test.tf", bytes),
+				Tokens: tokens,
+				ClientCaps: protocol.SemanticTokensClientCapabilities{
+					TokenTypes:     []string{"hcl-referenceStep"},
+					TokenModifiers: tc.tokenModifiers,
+				},
+			}
+			data := te.Encode()
+			if diff := cmp.Diff(tc.expectedData, data); diff != "" {
+				t.Fatalf("unexpected encoded data: %s", diff)
+			}
+		})
+	}
+}
+
+func TestTokenModifiersLegend_referenceKinds(t *testing.T) {
+	legend := TokenModifiersLegend(serverTokenModifiers.AsStrings())
+	for _, m := range []string{
+		"hcl-dependent", "hcl-metaArgument",
+		"hcl-keywordStep", "hcl-typeStep", "hcl-nameStep", "hcl-attrStep",
+		"opentofu-iteration", "opentofu-context", "opentofu-variable",
+	} {
+		if !sliceContains(legend.AsStrings(), m) {
+			t.Errorf("modifier %q missing from the server legend", m)
+		}
+	}
+}

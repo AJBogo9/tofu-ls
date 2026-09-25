@@ -9,6 +9,8 @@ import (
 	"context"
 
 	"github.com/creachadair/jrpc2"
+	"github.com/hashicorp/hcl-lang/lang"
+	"github.com/opentofu/tofu-ls/internal/document"
 	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 	lsp "github.com/opentofu/tofu-ls/internal/protocol"
 )
@@ -32,24 +34,7 @@ func (svc *service) TextDocumentSemanticTokensFull(ctx context.Context, params l
 		return tks, jrpc2.MethodNotFound.Err()
 	}
 
-	dh := ilsp.HandleFromDocumentURI(params.TextDocument.URI)
-	doc, err := svc.stateStore.DocumentStore.GetDocument(dh)
-	if err != nil {
-		return tks, err
-	}
-
-	jobIds, err := svc.stateStore.JobStore.ListIncompleteJobsForDir(dh.Dir)
-	if err != nil {
-		return tks, err
-	}
-	svc.stateStore.JobStore.WaitForJobs(ctx, jobIds...)
-
-	d, err := svc.decoderForDocument(ctx, doc)
-	if err != nil {
-		return tks, err
-	}
-
-	tokens, err := d.SemanticTokensInFile(ctx, doc.Filename)
+	doc, tokens, err := svc.semanticTokensForDocument(ctx, params.TextDocument.URI)
 	if err != nil {
 		return tks, err
 	}
@@ -62,4 +47,77 @@ func (svc *service) TextDocumentSemanticTokensFull(ctx context.Context, params l
 	tks.Data = te.Encode()
 
 	return tks, nil
+}
+
+// TextDocumentSemanticTokensRange returns the tokens on the lines of the
+// requested range, so that a client can color the visible part of a large
+// file before the full result arrives.
+func (svc *service) TextDocumentSemanticTokensRange(ctx context.Context, params lsp.SemanticTokensRangeParams) (lsp.SemanticTokens, error) {
+	tks := lsp.SemanticTokens{}
+
+	cc, err := ilsp.ClientCapabilities(ctx)
+	if err != nil {
+		return tks, err
+	}
+
+	caps := ilsp.SemanticTokensClientCapabilities{
+		SemanticTokensClientCapabilities: cc.TextDocument.SemanticTokens,
+	}
+	if !caps.RangeRequest() {
+		svc.logger.Printf("semantic tokens range request support not announced by client")
+		return tks, jrpc2.MethodNotFound.Err()
+	}
+
+	doc, tokens, err := svc.semanticTokensForDocument(ctx, params.TextDocument.URI)
+	if err != nil {
+		return tks, err
+	}
+
+	te := &ilsp.TokenEncoder{
+		Lines:      doc.Lines,
+		Tokens:     tokensOnLines(tokens, int(params.Range.Start.Line)+1, int(params.Range.End.Line)+1),
+		ClientCaps: cc.TextDocument.SemanticTokens,
+	}
+	tks.Data = te.Encode()
+
+	return tks, nil
+}
+
+func (svc *service) semanticTokensForDocument(ctx context.Context, uri lsp.DocumentURI) (*document.Document, []lang.SemanticToken, error) {
+	dh := ilsp.HandleFromDocumentURI(uri)
+	doc, err := svc.stateStore.DocumentStore.GetDocument(dh)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	jobIds, err := svc.stateStore.JobStore.ListIncompleteJobsForDir(dh.Dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	svc.stateStore.JobStore.WaitForJobs(ctx, jobIds...)
+
+	d, err := svc.decoderForDocument(ctx, doc)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	tokens, err := d.SemanticTokensInFile(ctx, doc.Filename)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return doc, tokens, nil
+}
+
+// tokensOnLines returns the tokens which touch any of the (1-based,
+// inclusive) lines from startLine to endLine, in their original order.
+func tokensOnLines(tokens []lang.SemanticToken, startLine, endLine int) []lang.SemanticToken {
+	inRange := make([]lang.SemanticToken, 0)
+	for _, token := range tokens {
+		if token.Range.End.Line < startLine || token.Range.Start.Line > endLine {
+			continue
+		}
+		inRange = append(inRange, token)
+	}
+	return inRange
 }
