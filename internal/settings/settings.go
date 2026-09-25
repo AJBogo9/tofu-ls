@@ -23,6 +23,21 @@ type ExperimentalFeatures struct {
 
 type ValidationOptions struct {
 	EnableEnhancedValidation bool `mapstructure:"enableEnhancedValidation" default:"true"`
+
+	// UnusedSymbols is copied from DiagnosticsOptions, so that it
+	// reaches the module jobs together with the validation options.
+	UnusedSymbols bool `mapstructure:"-"`
+}
+
+type RenameOptions struct {
+	// AddMovedBlock appends a moved block when a resource or a module
+	// call is renamed, so that OpenTofu does not destroy and recreate it.
+	AddMovedBlock bool `mapstructure:"addMovedBlock" default:"true"`
+}
+
+type DiagnosticsOptions struct {
+	// UnusedSymbols reports variables and locals which nothing references.
+	UnusedSymbols bool `mapstructure:"unusedSymbols" default:"true"`
 }
 
 type Indexing struct {
@@ -44,6 +59,9 @@ type Options struct {
 	ExperimentalFeatures ExperimentalFeatures `mapstructure:"experimentalFeatures"`
 
 	Validation ValidationOptions `mapstructure:"validation"`
+
+	Rename      RenameOptions      `mapstructure:"rename"`
+	Diagnostics DiagnosticsOptions `mapstructure:"diagnostics"`
 
 	IgnoreSingleFileWarning bool `mapstructure:"ignoreSingleFileWarning"`
 

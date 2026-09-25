@@ -17,6 +17,8 @@ const (
 	SchemaValidationSource
 	ReferenceValidationSource
 	TofuValidateSource
+	// UnusedSymbolsSource reports variables and locals nothing references.
+	UnusedSymbolsSource
 )
 
 func (d DiagnosticSource) String() string {

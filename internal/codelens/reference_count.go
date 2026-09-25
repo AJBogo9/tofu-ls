@@ -17,6 +17,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 	lsp "github.com/opentofu/tofu-ls/internal/protocol"
+	"github.com/opentofu/tofu-ls/internal/refactor"
 )
 
 func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
@@ -51,6 +52,9 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 			dedupedTargets[rng] = append(dedupedTargets[rng], refTarget)
 		}
 
+		// variables and locals no expression uses, read from the syntax
+		var unused map[string]bool
+
 		for rng, refTargets := range dedupedTargets {
 			originCount := 0
 			var defRange *hcl.Range
@@ -59,18 +63,23 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 					defRange = refTarget.DefRangePtr
 				}
 
-				paths := pathReader.Paths(ctx)
-				for _, p := range paths {
-					pathCtx, err := pathReader.PathContext(p)
-					if err != nil {
-						continue
-					}
-					originCount += len(pathCtx.ReferenceOrigins.Match(p, refTarget, path))
-				}
+				// resolved origins only: e.g. local.x does not count
+				// towards a provider named "local"
+				originCount += len(decoder.OriginsTargeting(ctx, pathReader, refTarget, path))
 			}
 
 			if originCount == 0 {
-				continue
+				if !showZeroReferences(refTargets) {
+					continue
+				}
+				if unused == nil {
+					unused = unusedNames(localCtx.Files)
+				}
+				if !unused[refTargets[0].Addr.String()] {
+					// the syntax has a use the decoder did not see, so
+					// "0 references" would be wrong
+					continue
+				}
 			}
 
 			var hclPos hcl.Pos
@@ -99,6 +108,38 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 
 		return lenses, nil
 	}
+}
+
+// showZeroReferences tells whether "0 references" is worth showing:
+// an unreferenced variable or local value is dead code, while nothing
+// references an output of a root module or a resource in normal use.
+func showZeroReferences(targets reference.Targets) bool {
+	for _, target := range targets {
+		if len(target.Addr) != 2 {
+			continue
+		}
+		root := target.Addr[0].String()
+		if (root == "var" && target.ScopeId == "variable") ||
+			(root == "local" && target.ScopeId == "local") {
+			return true
+		}
+	}
+	return false
+}
+
+// unusedNames returns the addresses (var.x, local.x) of the variables
+// and locals which no expression of the module uses.
+func unusedNames(files map[string]*hcl.File) map[string]bool {
+	names := make(map[string]bool, 0)
+	for _, sym := range refactor.UnusedSymbols(files) {
+		switch sym.Kind {
+		case refactor.KindVariable:
+			names["var."+sym.Name] = true
+		case refactor.KindLocal:
+			names["local."+sym.Name] = true
+		}
+	}
+	return names
 }
 
 type Position lsp.Position
