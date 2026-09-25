@@ -41,6 +41,9 @@ func (svc *service) TextDocumentHover(ctx context.Context, params lsp.TextDocume
 	}
 
 	svc.logger.Printf("Looking for hover data at %q -> %#v", doc.Filename, pos)
+	if hoverData, ok := svc.staticValueHover(doc, pos, d.Schema()); ok {
+		return ilsp.HoverData(hoverData, cc.TextDocument), nil
+	}
 	hoverData, err := d.HoverAtPos(ctx, doc.Filename, pos)
 	svc.logger.Printf("received hover data: %#v", hoverData)
 	if err != nil {

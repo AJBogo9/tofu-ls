@@ -257,7 +257,7 @@ func TestVarsHover_withValidData(t *testing.T) {
 			"result": {
 				"contents": {
 					"kind": "plaintext",
-					"value": "test required, sensitive, string"
+					"value": "var.test string\n\nrequired · sensitive\n\nMatches the variable's type.\n\nThis value is used: no automatically loaded file after it sets the variable.\n\nMay be overridden by -var or -var-file.\n\nDeclared in variables.tf"
 				},
 				"range": {
 					"start": { "line":0, "character":0 },

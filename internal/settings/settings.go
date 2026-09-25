@@ -45,6 +45,13 @@ type Indexing struct {
 	IgnorePaths          []string `mapstructure:"ignorePaths"`
 }
 
+type InlayHints struct {
+	// Values shows the statically known value after var and local references.
+	Values bool `mapstructure:"values" default:"true"`
+	// MaxLength caps the characters of a value hint.
+	MaxLength int `mapstructure:"maxLength" default:"40"`
+}
+
 type Tofu struct {
 	Path        string `mapstructure:"path"`
 	Timeout     string `mapstructure:"timeout"`
@@ -62,6 +69,7 @@ type Options struct {
 
 	Rename      RenameOptions      `mapstructure:"rename"`
 	Diagnostics DiagnosticsOptions `mapstructure:"diagnostics"`
+	InlayHints  InlayHints         `mapstructure:"inlayHints"`
 
 	IgnoreSingleFileWarning bool `mapstructure:"ignoreSingleFileWarning"`
 
