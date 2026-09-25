@@ -51,6 +51,7 @@ func initializeResponse(t *testing.T, commandPrefix string) string {
 				"declarationProvider": true,
 				"definitionProvider": true,
 				"referencesProvider": true,
+				"documentHighlightProvider": true,
 				"documentSymbolProvider": true,
 				"codeActionProvider": {
 					"codeActionKinds": ["source.formatAll.opentofu"]
@@ -59,6 +60,11 @@ func initializeResponse(t *testing.T, commandPrefix string) string {
 				"documentLinkProvider": {},
 				"workspaceSymbolProvider": true,
 				"documentFormattingProvider": true,
+				"renameProvider": {
+					"prepareProvider": true
+				},
+				"foldingRangeProvider": true,
+				"selectionRangeProvider": true,
 				"executeCommandProvider": {
 					"commands": %s,
 					"workDoneProgress":true

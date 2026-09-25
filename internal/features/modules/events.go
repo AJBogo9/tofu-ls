@@ -243,10 +243,18 @@ func (f *ModulesFeature) decodeModule(ctx context.Context, dir document.DirHandl
 	ids := make(job.IDs, 0)
 	path := dir.Path()
 
+	// read before the job runs, see the note on validationOptions below
+	parseValidationOptions, _ := lsctx.ValidationOptions(ctx)
+
 	parseId, err := f.stateStore.JobStore.EnqueueJob(ctx, job.Job{
 		Dir: dir,
 		Func: func(ctx context.Context) error {
-			return jobs.ParseModuleConfiguration(ctx, f.fs, f.Store, path)
+			err := jobs.ParseModuleConfiguration(ctx, f.fs, f.Store, path)
+			if err == nil && parseValidationOptions.UnusedSymbols {
+				// needs only the parsed files, so it runs right after parsing
+				return jobs.UnusedSymbols(ctx, f.fs, f.Store, path)
+			}
+			return err
 		},
 		Type:        op.OpTypeParseModuleConfiguration.String(),
 		IgnoreState: ignoreState,

@@ -72,6 +72,8 @@ type service struct {
 	tfExecFactory  exec.ExecutorFactory
 	tfExecOpts     *exec.ExecutorOpts
 	decoder        *decoder.Decoder
+	pathReader     decoder.PathReader
+	renameOptions  settings.RenameOptions
 	stateStore     *state.StateStore
 	server         session.Server
 	diagsNotifier  *diagnostics.Notifier
@@ -341,6 +343,46 @@ func (svc *service) Assigner() (jrpc2.Assigner, error) {
 
 			return handle(ctx, req, svc.DidChangeWatchedFiles)
 		},
+		"textDocument/documentHighlight": func(ctx context.Context, req *jrpc2.Request) (interface{}, error) {
+			err := session.CheckInitializationIsConfirmed()
+			if err != nil {
+				return nil, err
+			}
+
+			return handle(ctx, req, svc.DocumentHighlight)
+		},
+		"textDocument/foldingRange": func(ctx context.Context, req *jrpc2.Request) (interface{}, error) {
+			err := session.CheckInitializationIsConfirmed()
+			if err != nil {
+				return nil, err
+			}
+
+			return handle(ctx, req, svc.FoldingRange)
+		},
+		"textDocument/selectionRange": func(ctx context.Context, req *jrpc2.Request) (interface{}, error) {
+			err := session.CheckInitializationIsConfirmed()
+			if err != nil {
+				return nil, err
+			}
+
+			return handle(ctx, req, svc.SelectionRange)
+		},
+		"textDocument/prepareRename": func(ctx context.Context, req *jrpc2.Request) (interface{}, error) {
+			err := session.CheckInitializationIsConfirmed()
+			if err != nil {
+				return nil, err
+			}
+
+			return handle(ctx, req, svc.PrepareRename)
+		},
+		"textDocument/rename": func(ctx context.Context, req *jrpc2.Request) (interface{}, error) {
+			err := session.CheckInitializationIsConfirmed()
+			if err != nil {
+				return nil, err
+			}
+
+			return handle(ctx, req, svc.Rename)
+		},
 		"textDocument/references": func(ctx context.Context, req *jrpc2.Request) (interface{}, error) {
 			err := session.CheckInitializationIsConfirmed()
 			if err != nil {
@@ -535,12 +577,13 @@ func (svc *service) configureSessionDependencies(ctx context.Context, cfgOpts *s
 		}
 	}
 
-	svc.decoder = decoder.NewDecoder(&idecoder.GlobalPathReader{
+	svc.pathReader = &idecoder.GlobalPathReader{
 		PathReaderMap: idecoder.PathReaderMap{
 			ilsp.OpenTofu.String():     svc.features.Modules,
 			ilsp.OpenTofuVars.String(): svc.features.Variables,
 		},
-	})
+	}
+	svc.decoder = decoder.NewDecoder(svc.pathReader)
 	decoderContext := idecoder.DecoderContext(ctx)
 	svc.features.Modules.AppendCompletionHooks(svc.srvCtx, decoderContext)
 	svc.decoder.SetContext(decoderContext)

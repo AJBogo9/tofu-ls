@@ -46,6 +46,8 @@ func (svc *service) Initialize(ctx context.Context, params lsp.InitializeParams)
 		}
 	}
 
+	svc.renameOptions = out.Options.Rename
+
 	expServerCaps := lsp.ExperimentalServerCapabilities{}
 
 	if _, ok := expClientCaps.ShowReferencesCommandId(); ok {
@@ -100,7 +102,9 @@ func (svc *service) Initialize(ctx context.Context, params lsp.InitializeParams)
 	// set experimental feature flags
 	lsctx.SetExperimentalFeatures(ctx, out.Options.ExperimentalFeatures)
 	// set validation options for jobs
-	lsctx.SetValidationOptions(ctx, out.Options.Validation)
+	validationOptions := out.Options.Validation
+	validationOptions.UnusedSymbols = out.Options.Diagnostics.UnusedSymbols
+	lsctx.SetValidationOptions(ctx, validationOptions)
 
 	if len(out.UnusedKeys) > 0 {
 		jrpc2.ServerFromContext(ctx).Notify(ctx, "window/showMessage", &lsp.ShowMessageParams{
@@ -191,6 +195,12 @@ func initializeResult(ctx context.Context) lsp.InitializeResult {
 			DocumentFormattingProvider: true,
 			DocumentSymbolProvider:     true,
 			WorkspaceSymbolProvider:    true,
+			RenameProvider: lsp.RenameOptions{
+				PrepareProvider: true,
+			},
+			DocumentHighlightProvider: true,
+			FoldingRangeProvider:      true,
+			SelectionRangeProvider:    true,
 			Workspace: lsp.Workspace6Gn{
 				WorkspaceFolders: lsp.WorkspaceFolders5Gn{
 					Supported:           true,
