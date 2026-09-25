@@ -34,7 +34,9 @@ func init() {
 	for _, tokType := range lang.SupportedSemanticTokenTypes {
 		serverTokenTypes = append(serverTokenTypes, semtok.TokenType(tokType))
 	}
-	serverTokenModifiers = append(serverTokenModifiers, semtok.TokenModifier(lang.TokenModifierDependent))
+	for _, tokModifier := range lang.SupportedSemanticTokenModifiers {
+		serverTokenModifiers = append(serverTokenModifiers, semtok.TokenModifier(tokModifier))
+	}
 	for _, tokModifier := range tfschema.SemanticTokenModifiers {
 		serverTokenModifiers = append(serverTokenModifiers, semtok.TokenModifier(tokModifier))
 	}
@@ -78,4 +80,8 @@ func (c SemanticTokensClientCapabilities) FullRequest() bool {
 		return true
 	}
 	return false
+}
+
+func (c SemanticTokensClientCapabilities) RangeRequest() bool {
+	return c.Requests.Range
 }

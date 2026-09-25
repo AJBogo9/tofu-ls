@@ -10,7 +10,10 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/go-version"
+	"github.com/hashicorp/hcl-lang/lang"
+	"github.com/hashicorp/hcl/v2"
 	tfjson "github.com/hashicorp/terraform-json"
 	"github.com/opentofu/tofu-ls/internal/langserver"
 	"github.com/opentofu/tofu-ls/internal/state"
@@ -505,4 +508,160 @@ func TestVarsSemanticTokensFull_functionToken(t *testing.T) {
 				]
 			}
 		}`)
+}
+
+func TestSemanticTokensRange(t *testing.T) {
+	tmpDir := TempDir(t)
+	InitPluginCache(t, tmpDir.Path())
+
+	var testSchema tfjson.ProviderSchemas
+	err := json.Unmarshal([]byte(testModuleSchemaOutput), &testSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ss, err := state.NewStateStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wc := walker.NewWalkerCollector()
+
+	ls := langserver.NewLangServerMock(t, NewMockSession(&MockSessionInput{
+		TofuCalls: &exec.TofuMockCalls{
+			PerWorkDir: map[string][]*mock.Call{
+				tmpDir.Path(): {
+					{
+						Method:        "Version",
+						Repeatability: 1,
+						Arguments: []interface{}{
+							mock.AnythingOfType(""),
+						},
+						ReturnArguments: []interface{}{
+							version.Must(version.NewVersion("0.12.0")),
+							nil,
+							nil,
+						},
+					},
+					{
+						Method:        "GetExecPath",
+						Repeatability: 1,
+						ReturnArguments: []interface{}{
+							"",
+						},
+					},
+					{
+						Method:        "ProviderSchemas",
+						Repeatability: 1,
+						Arguments: []interface{}{
+							mock.AnythingOfType(""),
+						},
+						ReturnArguments: []interface{}{
+							&testSchema,
+							nil,
+						},
+					},
+				},
+			},
+		},
+		StateStore:      ss,
+		WalkerCollector: wc,
+	}))
+	stop := ls.Start(t)
+	defer stop()
+
+	ls.Call(t, &langserver.CallRequest{
+		Method: "initialize",
+		ReqParams: fmt.Sprintf(`{
+		"capabilities": {
+			"textDocument": {
+				"semanticTokens": {
+					"tokenTypes": [
+						"enumMember",
+						"property",
+						"string",
+						"type"
+					],
+					"tokenModifiers": [
+						"defaultLibrary",
+						"deprecated"
+					],
+					"requests": {
+						"full": true,
+						"range": true
+					}
+				}
+			}
+		},
+		"rootUri": %q,
+		"processId": 12345
+	}`, tmpDir.URI)})
+	waitForWalkerPath(t, ss, wc, tmpDir)
+	ls.Notify(t, &langserver.CallRequest{
+		Method:    "initialized",
+		ReqParams: "{}",
+	})
+	ls.Call(t, &langserver.CallRequest{
+		Method: "textDocument/didOpen",
+		ReqParams: fmt.Sprintf(`{
+		"textDocument": {
+			"version": 0,
+			"languageId": "opentofu",
+			"text": "variable \"a\" {\n}\n\nvariable \"b\" {\n}\n",
+			"uri": "%s/main.tf"
+		}
+	}`, tmpDir.URI)})
+	waitForAllJobs(t, ss)
+
+	// only the second block is on the requested lines
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/semanticTokens/range",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {
+				"uri": "%s/main.tf"
+			},
+			"range": {
+				"start": {"line": 3, "character": 0},
+				"end": {"line": 4, "character": 1}
+			}
+		}`, tmpDir.URI)}, `{
+			"jsonrpc": "2.0",
+			"id": 3,
+			"result": {
+				"data": [
+					3,0,8,3,0,
+					0,9,3,0,0
+				]
+			}
+		}`)
+}
+
+func TestTokensOnLines(t *testing.T) {
+	tokenOn := func(startLine, endLine int) lang.SemanticToken {
+		return lang.SemanticToken{
+			Type: lang.TokenString,
+			Range: hcl.Range{
+				Start: hcl.Pos{Line: startLine, Column: 1},
+				End:   hcl.Pos{Line: endLine, Column: 2},
+			},
+		}
+	}
+	tokens := []lang.SemanticToken{tokenOn(1, 1), tokenOn(2, 4), tokenOn(5, 5), tokenOn(7, 7)}
+
+	testCases := []struct {
+		startLine, endLine int
+		expected           []lang.SemanticToken
+	}{
+		{1, 1, []lang.SemanticToken{tokenOn(1, 1)}},
+		{3, 3, []lang.SemanticToken{tokenOn(2, 4)}},
+		{4, 5, []lang.SemanticToken{tokenOn(2, 4), tokenOn(5, 5)}},
+		{6, 6, []lang.SemanticToken{}},
+		{1, 9, tokens},
+	}
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%d-%d", tc.startLine, tc.endLine), func(t *testing.T) {
+			if diff := cmp.Diff(tc.expected, tokensOnLines(tokens, tc.startLine, tc.endLine)); diff != "" {
+				t.Fatalf("unexpected tokens: %s", diff)
+			}
+		})
+	}
 }

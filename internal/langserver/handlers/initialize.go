@@ -84,6 +84,9 @@ func (svc *service) Initialize(ctx context.Context, params lsp.InitializeParams)
 		},
 		Full: caps.FullRequest(),
 	}
+	if caps.RangeRequest() {
+		semanticTokensOpts.Range = true
+	}
 
 	serverCaps.Capabilities.SemanticTokensProvider = semanticTokensOpts
 
