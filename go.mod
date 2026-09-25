@@ -2,7 +2,7 @@ module github.com/opentofu/tofu-ls
 
 go 1.26.0
 
-replace github.com/hashicorp/hcl-lang => github.com/opentofu/hcl-lang v0.0.0-20260707084237-1d4085a34474
+replace github.com/hashicorp/hcl-lang => ../hcl-lang
 
 require (
 	github.com/apparentlymart/go-textseg v1.0.0
@@ -140,3 +140,5 @@ tool (
 	github.com/vektra/mockery/v2
 	golang.org/x/tools/cmd/stringer
 )
+
+replace github.com/opentofu/opentofu-schema => ../opentofu-schema
