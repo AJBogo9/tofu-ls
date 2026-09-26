@@ -30,6 +30,8 @@ type EventBus struct {
 
 	manifestChangeTopic   *Topic[ManifestChangeEvent]
 	pluginLockChangeTopic *Topic[PluginLockChangeEvent]
+
+	providerSchemasChangeTopic *Topic[ProviderSchemasChangeEvent]
 }
 
 func NewEventBus() *EventBus {
@@ -41,6 +43,8 @@ func NewEventBus() *EventBus {
 		discoverTopic:         NewTopic[DiscoverEvent](),
 		manifestChangeTopic:   NewTopic[ManifestChangeEvent](),
 		pluginLockChangeTopic: NewTopic[PluginLockChangeEvent](),
+
+		providerSchemasChangeTopic: NewTopic[ProviderSchemasChangeEvent](),
 	}
 }
 

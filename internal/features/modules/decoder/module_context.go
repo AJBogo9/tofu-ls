@@ -18,7 +18,7 @@ import (
 var semanticHighlighting = tfschema.SemanticHighlighting()
 
 func modulePathContext(mod *state.ModuleRecord, stateReader CombinedReader) (*decoder.PathContext, error) {
-	schema, err := schemaForModule(mod, stateReader)
+	schema, registryCalls, err := schemaForModule(mod, stateReader)
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +33,7 @@ func modulePathContext(mod *state.ModuleRecord, stateReader CombinedReader) (*de
 		ReferenceTargets: make(reference.Targets, 0),
 		Files:            make(map[string]*hcl.File, 0),
 		Functions:        functions,
-		Validators:       moduleValidators,
+		Validators:       validatorsForModule(registryCalls),
 
 		SemanticHighlighting: semanticHighlighting,
 	}

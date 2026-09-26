@@ -4,6 +4,7 @@
 package staticval
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1180,5 +1181,72 @@ func TestParseFile_cacheFollowsContent(t *testing.T) {
 	attrs, _ := b.Body.(*hclsyntax.Body).Blocks[0].Body.JustAttributes()
 	if v, _ := attrs["a"].Expr.Value(nil); !v.RawEquals(cty.NumberIntVal(2)) {
 		t.Fatalf("unexpected value %#v", v)
+	}
+}
+
+// TestCallingRoots checks which root modules run a module through its
+// callers: OpenTofu resolves a bare relative path from the root's
+// directory, the working directory, not from the module's.
+func TestCallingRoots(t *testing.T) {
+	call := func(source string) string {
+		return fmt.Sprintf("module \"m\" {\n  source = %q\n}\n", source)
+	}
+	testCases := []struct {
+		name    string
+		files   map[string]string
+		module  string
+		nesting int
+		// want are the roots relative to the tree, "?" when they are not
+		// all known
+		want []string
+	}{
+		{"a root module", map[string]string{"app/main.tf": ""}, "app", 3, []string{"app"}},
+		{"one caller", map[string]string{"main.tf": call("./modules/app"), "modules/app/main.tf": ""}, "modules/app", 3, []string{"."}},
+		{"the caller's caller", map[string]string{
+			"main.tf":                  call("./modules/a"),
+			"modules/a/main.tf":        call("./b"),
+			"modules/a/b/main.tf":      "",
+			"modules/a/b/files/x.json": "{}",
+		}, "modules/a/b", 3, []string{"."}},
+		{"two roots", map[string]string{
+			"main.tf":             call("./modules/app"),
+			"modules/main.tf":     call("./app"),
+			"modules/app/main.tf": "",
+		}, "modules/app", 3, []string{".", "modules"}},
+		{"callers too deep to resolve", map[string]string{
+			"main.tf":             call("./modules/a"),
+			"modules/a/main.tf":   call("./b"),
+			"modules/a/b/main.tf": "",
+		}, "modules/a/b", 0, []string{"?"}},
+		{"installed below .terraform", map[string]string{
+			"main.tf":                          call("x/y/z"),
+			".terraform/modules/m/main.tf":     "",
+			".terraform/modules/m/sub/main.tf": "",
+		}, ".terraform/modules/m", 3, []string{"."}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeTree(t, tc.files)
+			mod, err := LoadModule(osFS{}, filepath.Join(root, filepath.FromSlash(tc.module)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			AddCallers(osFS{}, mod, tc.nesting, nil)
+			roots, ok := CallingRoots(mod)
+			got := []string{"?"}
+			if ok {
+				got = make([]string, 0, len(roots))
+				for _, r := range roots {
+					rel, err := filepath.Rel(root, r)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got = append(got, filepath.ToSlash(rel))
+				}
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatalf("unexpected roots (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

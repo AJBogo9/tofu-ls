@@ -41,24 +41,41 @@ func (svc *service) setValueInputs(opts settings.Values) ([]string, bool) {
 	}
 	varFiles := make(map[string][]string, len(opts.VarFiles))
 	for dir, files := range opts.VarFiles {
-		path := dir
-		if strings.HasPrefix(dir, "file:") {
-			p, err := uri.PathFromURI(dir)
-			if err != nil {
-				continue
-			}
-			path = p
-		}
-		if !filepath.IsAbs(path) {
+		path, ok := valuesDirPath(dir)
+		if !ok {
 			continue
 		}
 		varFiles[path] = files
+	}
+	vars := make(map[string][]staticval.VarFlag, len(opts.Vars))
+	for dir, flags := range opts.Vars {
+		path, ok := valuesDirPath(dir)
+		if !ok {
+			continue
+		}
+		for _, f := range flags {
+			vars[path] = append(vars[path], staticval.VarFlag{Raw: f.Raw, After: f.After})
+		}
 	}
 	var envVars map[string]string
 	if opts.ReadEnvironment {
 		envVars = staticval.EnvVarsFrom(os.Environ())
 	}
-	return svc.valueInputs.Set(varFiles, envVars)
+	return svc.valueInputs.Set(varFiles, vars, envVars)
+}
+
+// valuesDirPath returns the absolute path of a module directory given as
+// a path or a file URI.
+func valuesDirPath(dir string) (string, bool) {
+	path := dir
+	if strings.HasPrefix(dir, "file:") {
+		p, err := uri.PathFromURI(dir)
+		if err != nil {
+			return "", false
+		}
+		path = p
+	}
+	return path, filepath.IsAbs(path)
 }
 
 // valuesInputsHandler answers tofu-ls.values.inputs, with which the
@@ -66,6 +83,9 @@ func (svc *service) setValueInputs(opts settings.Values) ([]string, bool) {
 //
 //   - varFiles: a JSON object from module directory (URI or path) to its
 //     -var-file files, relative to the module, in order;
+//   - vars: a JSON object from module directory to its -var options, in
+//     order, each {"raw": "name=value", "after": n} with the number of its
+//     -var-file files given before it;
 //   - readEnvironment: whether the TF_VAR_ variables of the language
 //     server's environment are read.
 //
@@ -77,6 +97,11 @@ func (svc *service) valuesInputsHandler(ctx context.Context, args cmd.CommandArg
 	if raw, ok := args.GetString("varfiles"); ok && raw != "" {
 		if err := json.Unmarshal([]byte(raw), &opts.VarFiles); err != nil {
 			return nil, fmt.Errorf("%w: varFiles is not a JSON object of file lists: %s", jrpc2.InvalidParams.Err(), err)
+		}
+	}
+	if raw, ok := args.GetString("vars"); ok && raw != "" {
+		if err := json.Unmarshal([]byte(raw), &opts.Vars); err != nil {
+			return nil, fmt.Errorf("%w: vars is not a JSON object of -var option lists: %s", jrpc2.InvalidParams.Err(), err)
 		}
 	}
 	opts.ReadEnvironment, _ = args.GetBool("readenvironment")

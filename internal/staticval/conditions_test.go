@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/zclconf/go-cty/cty"
@@ -129,6 +130,25 @@ variable "anything" {
 		{"TF_VAR_ of an undeclared variable is ignored", bare, Inputs{EnvVars: map[string]string{"zzz": "1"}}, "n", `0`, "default"},
 		{"a missing -var-file is refused", bare, Inputs{VarFiles: []string{"envs/nope.tfvars"}}, "a", "refused", ""},
 		{"a -var-file outside the module is not read", bare, Inputs{VarFiles: []string{"../outside.tfvars", "/etc/x.tfvars"}}, "a", `"default"`, "default"},
+		// -var options, in their order among the -var-file files
+		{"-var is above every auto file", full, Inputs{Vars: []VarFlag{{Raw: "a=cli"}}}, "a", `"cli"`, "-var a"},
+		{"-var after a -var-file wins", full, Inputs{VarFiles: []string{"envs/prod.tfvars"}, Vars: []VarFlag{{Raw: "a=cli", After: 1}}}, "a", `"cli"`, "-var a"},
+		{"a -var-file after -var wins", full, Inputs{VarFiles: []string{"envs/prod.tfvars"}, Vars: []VarFlag{{Raw: "a=cli"}}}, "a", `"prod"`, "envs/prod.tfvars"},
+		{"-var between two -var-file", full, Inputs{VarFiles: []string{"envs/prod.tfvars", "envs/stage.tfvars"}, Vars: []VarFlag{{Raw: "a=cli", After: 1}}}, "a", `"stage"`, "envs/stage.tfvars"},
+		{"the last -var wins", bare, Inputs{Vars: []VarFlag{{Raw: "a=one"}, {Raw: "a=two"}}}, "a", `"two"`, "-var a"},
+		{"-var is above TF_VAR_", bare, Inputs{Vars: []VarFlag{{Raw: "a=cli"}}, EnvVars: map[string]string{"a": "fromenv"}}, "a", `"cli"`, "-var a"},
+		{"-var of a number converts", bare, Inputs{Vars: []VarFlag{{Raw: "n=7"}}}, "n", `7`, "-var n"},
+		{"-var of a number with spaces is invalid", bare, Inputs{Vars: []VarFlag{{Raw: "n= 7 "}}}, "n", "unknown", ""},
+		{"-var of an untyped variable is a string", bare, Inputs{Vars: []VarFlag{{Raw: "untyped=[1,2]"}}}, "untyped", `"[1,2]"`, "-var untyped"},
+		{"-var of type any is HCL", bare, Inputs{Vars: []VarFlag{{Raw: "anything=[1,2]"}}}, "anything", `[1, 2]`, "-var anything"},
+		{"-var of type any that is not HCL is refused", bare, Inputs{Vars: []VarFlag{{Raw: "anything=hello"}}}, "a", "refused", ""},
+		{"-var of an object is HCL", bare, Inputs{Vars: []VarFlag{{Raw: `obj={n=3, tags=["x"]}`}}}, "obj", `{ n = 3, tags = ["x"] }`, "-var obj"},
+		{"-var of a string keeps quotes as text", bare, Inputs{Vars: []VarFlag{{Raw: `a="q"`}}}, "a", `"\"q\""`, "-var a"},
+		{"-var with an empty value", bare, Inputs{Vars: []VarFlag{{Raw: "a="}}}, "a", `""`, "-var a"},
+		{"-var value with an equals sign", bare, Inputs{Vars: []VarFlag{{Raw: "a=x=y"}}}, "a", `"x=y"`, "-var a"},
+		{"-var of an undeclared variable is refused", bare, Inputs{Vars: []VarFlag{{Raw: "zzz=1"}}}, "a", "refused", ""},
+		{"-var without an equals sign is refused", bare, Inputs{Vars: []VarFlag{{Raw: "a"}}}, "a", "refused", ""},
+		{"-var with spaces around the name is refused", bare, Inputs{Vars: []VarFlag{{Raw: "a = x"}}}, "a", "refused", ""},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -639,14 +659,43 @@ check "c" {
 func TestInputsStore(t *testing.T) {
 	s := NewInputsStore()
 	changed, env := s.Set(map[string][]string{
-		"/w/root":  {"envs/prod.tfvars", "./extra.tfvars", "../escape.tfvars", "/abs.tfvars"},
+		"/w/root":  {"envs/prod.tfvars", "../escape.tfvars", "./extra.tfvars", "/abs.tfvars"},
 		"/w/other": {"../x.tfvars"},
+	}, map[string][]VarFlag{
+		// after the first two files given, of which one is dropped
+		"/w/root": {{Raw: "a=1", After: 2}, {Raw: "b=2", After: 4}},
 	}, nil)
 	if strings.Join(changed, ",") != "/w/root" || env {
 		t.Fatalf("unexpected change: %q %v", changed, env)
 	}
 	if got := s.Inputs("/w/root/").VarFiles; strings.Join(got, ",") != "envs/prod.tfvars,extra.tfvars" {
 		t.Fatalf("unexpected var files: %q", got)
+	}
+	if diff := cmp.Diff([]VarFlag{{Raw: "a=1", After: 1}, {Raw: "b=2", After: 2}}, s.Inputs("/w/root").Vars); diff != "" {
+		t.Fatalf("unexpected -var options (-want +got):\n%s", diff)
+	}
+	// -var options alone choose inputs for a module
+	changed, _ = s.Set(map[string][]string{
+		"/w/root": {"envs/prod.tfvars", "extra.tfvars"},
+	}, map[string][]VarFlag{
+		"/w/root":  {{Raw: "a=1", After: 1}, {Raw: "b=2", After: 2}},
+		"/w/other": {{Raw: "c=3"}},
+	}, nil)
+	if strings.Join(changed, ",") != "/w/other" {
+		t.Fatalf("unexpected change: %q", changed)
+	}
+	changed, _ = s.Set(map[string][]string{
+		"/w/root": {"envs/prod.tfvars", "extra.tfvars"},
+	}, map[string][]VarFlag{
+		"/w/root":  {{Raw: "a=changed", After: 1}, {Raw: "b=2", After: 2}},
+		"/w/other": {{Raw: "c=3"}},
+	}, nil)
+	if strings.Join(changed, ",") != "/w/root" {
+		t.Fatalf("unexpected change: %q", changed)
+	}
+	changed, _ = s.Set(map[string][]string{"/w/root": {"envs/prod.tfvars", "extra.tfvars"}}, nil, nil)
+	if strings.Join(changed, ",") != "/w/other,/w/root" {
+		t.Fatalf("unexpected change: %q", changed)
 	}
 	if got := s.Selecting("/w/root/envs"); strings.Join(got, ",") != "/w/root" {
 		t.Fatalf("unexpected modules choosing envs: %q", got)
@@ -657,11 +706,11 @@ func TestInputsStore(t *testing.T) {
 	if _, _, ok := s.ModuleOf("/w/root/envs/stage.tfvars"); ok {
 		t.Fatal("a file nobody chose has a module")
 	}
-	changed, env = s.Set(map[string][]string{"/w/root": {"envs/prod.tfvars", "extra.tfvars"}}, map[string]string{"a": "1"})
+	changed, env = s.Set(map[string][]string{"/w/root": {"envs/prod.tfvars", "extra.tfvars"}}, nil, map[string]string{"a": "1"})
 	if len(changed) != 0 || !env {
 		t.Fatalf("unexpected change: %q %v", changed, env)
 	}
-	changed, _ = s.Set(nil, map[string]string{"a": "1"})
+	changed, _ = s.Set(nil, nil, map[string]string{"a": "1"})
 	if strings.Join(changed, ",") != "/w/root" {
 		t.Fatalf("unexpected change: %q", changed)
 	}
@@ -692,7 +741,32 @@ locals {
 	})
 	in := Inputs{VarFiles: []string{"envs/prod.tfvars"}, EnvVars: map[string]string{"token": "hunter2"}}
 	ev := inputsEvaluator(t, root, in)
-	h, ok := ev.HoverAt("main.tf", posOf(t, ev, "main.tf", "var.stage", 5), inputsEnv(in))
+
+	// -var options name their source, and are never shown for a
+	// sensitive variable either
+	cli := Inputs{VarFiles: in.VarFiles, Vars: []VarFlag{{Raw: "stage=cli", After: 1}, {Raw: "token=s3cret", After: 1}}, EnvVars: in.EnvVars}
+	cliEv := inputsEvaluator(t, root, cli)
+	h, ok := cliEv.HoverAt("main.tf", posOf(t, cliEv, "main.tf", "var.stage", 5), inputsEnv(cli))
+	if !ok || !strings.Contains(h.Content, "**Value** `\"cli\"` from `-var stage` (plan arguments)") ||
+		!strings.Contains(h.Content, "Overrides: `envs/prod.tfvars` (selected environment) sets `\"prod\"`; `terraform.tfvars` sets `\"dev\"`") {
+		t.Fatalf("unexpected hover: %v %s", ok, hoverContent(h))
+	}
+	h, ok = cliEv.HoverAt("main.tf", posOf(t, cliEv, "main.tf", "var.token", 5), inputsEnv(cli))
+	if !ok || !strings.Contains(h.Content, "from `-var token` (plan arguments)") ||
+		!strings.Contains(h.Content, "Overrides: `TF_VAR_token` (environment)") ||
+		strings.Contains(h.Content, "s3cret") || strings.Contains(h.Content, "hunter2") {
+		t.Fatalf("unexpected hover: %v %s", ok, hoverContent(h))
+	}
+	if r := cliEv.EvalLocal("t"); !r.IsKnown() || !r.IsSensitive() {
+		t.Fatalf("expected a known sensitive value, got %#v", r)
+	}
+	f, _ := parseFile(filepath.Join(root, "envs", "prod.tfvars"), []byte("stage = \"prod\"\n"))
+	h, ok = cliEv.VarsFileHover("envs/prod.tfvars", f, hcl.Pos{Line: 1, Column: 3, Byte: 2})
+	if !ok || !strings.Contains(h.Content, "**Overridden** by `-var stage` (plan arguments), which sets `\"cli\"`.") {
+		t.Fatalf("unexpected hover: %v %s", ok, hoverContent(h))
+	}
+
+	h, ok = ev.HoverAt("main.tf", posOf(t, ev, "main.tf", "var.stage", 5), inputsEnv(in))
 	if !ok || !strings.Contains(h.Content, "**Value** `\"prod\"` from `envs/prod.tfvars` (selected environment)") ||
 		!strings.Contains(h.Content, "Overrides: `terraform.tfvars` sets `\"dev\"`") {
 		t.Fatalf("unexpected hover: %v %s", ok, hoverContent(h))
@@ -702,7 +776,7 @@ locals {
 		t.Fatalf("unexpected hover: %v %s", ok, hoverContent(h))
 	}
 
-	f, _ := parseFile(filepath.Join(root, "envs", "prod.tfvars"), []byte("stage = \"prod\"\n"))
+	f, _ = parseFile(filepath.Join(root, "envs", "prod.tfvars"), []byte("stage = \"prod\"\n"))
 	h, ok = ev.VarsFileHover("envs/prod.tfvars", f, hcl.Pos{Line: 1, Column: 3, Byte: 2})
 	if !ok || !strings.Contains(h.Content, "Selected environment: OpenTofu applies this file with `-var-file=envs/prod.tfvars`.") ||
 		!strings.Contains(h.Content, "**This value is used**") {
@@ -759,6 +833,8 @@ resource "terraform_data" "x" {
 		{"terraform.tfvars", map[string]string{"terraform.tfvars": ""}, Inputs{}, "stage precondition"},
 		{"an auto tfvars file", map[string]string{"x.auto.tfvars.json": "{}"}, Inputs{}, "stage precondition"},
 		{"a backend", map[string]string{"backend.tf": "terraform {\n  backend \"local\" {}\n}\n"}, Inputs{}, "stage precondition"},
+		{"a cloud block", map[string]string{"cloud.tf": "terraform {\n  cloud {\n    organization = \"o\"\n  }\n}\n"}, Inputs{}, "stage precondition"},
+		{"a terraform block without a backend", map[string]string{"versions.tf": "terraform {\n  required_version = \">= 1.6\"\n}\n"}, Inputs{}, ""},
 		{"a chosen environment", map[string]string{"envs/prod.tfvars": ""}, Inputs{VarFiles: []string{"envs/prod.tfvars"}}, "stage precondition"},
 	}
 	for _, tc := range testCases {

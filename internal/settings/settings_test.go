@@ -206,6 +206,22 @@ func TestDecodeOptions_values(t *testing.T) {
 				ReadEnvironment: true,
 			},
 		},
+		{
+			"-var options per module, as JSON numbers decode",
+			map[string]interface{}{
+				"values": map[string]interface{}{
+					"vars": map[string]interface{}{
+						"file:///work/root": []interface{}{
+							map[string]interface{}{"raw": "stage=cli", "after": float64(1)},
+							map[string]interface{}{"raw": "n=1"},
+						},
+					},
+				},
+			},
+			Values{
+				Vars: map[string][]VarOption{"file:///work/root": {{Raw: "stage=cli", After: 1}, {Raw: "n=1"}}},
+			},
+		},
 	}
 	for i, tc := range testCases {
 		t.Run(fmt.Sprintf("%d-%s", i, tc.name), func(t *testing.T) {

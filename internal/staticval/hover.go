@@ -380,13 +380,16 @@ func (ev *Evaluator) variableHover(name string, ref *hclsyntax.ScopeTraversalExp
 }
 
 // sourceName names where an assignment comes from: a tfvars file, a file
-// of the selected environment (-var-file), or a TF_VAR_ variable.
+// of the selected environment (-var-file), a TF_VAR_ variable, or a -var
+// option of the plan arguments.
 func sourceName(a *Assignment) string {
 	switch a.Kind {
 	case FromVarFile:
 		return "`" + a.File + "` (selected environment)"
 	case FromEnvironment:
 		return "`" + a.File + "` (environment)"
+	case FromCommandLine:
+		return "`" + a.File + "` (plan arguments)"
 	}
 	return "`" + a.File + "`"
 }

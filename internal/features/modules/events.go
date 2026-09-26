@@ -205,6 +205,50 @@ func (f *ModulesFeature) didChangeWatched(ctx context.Context, rawPath string, c
 	return ids, nil
 }
 
+// providerSchemasChange validates the module in dir again, once, after
+// the provider schemas of the root module in dir were obtained (tofu
+// providers schema), on the first open or after tofu init: the unknown
+// resource type check needs the schema of the locked provider version,
+// the installation check what tofu init installed, and a validation that
+// ran before, or runs now, may have missed them. A module whose
+// validation has not started yet reads the schemas when it does.
+func (f *ModulesFeature) providerSchemasChange(ctx context.Context, dir document.DirHandle) (job.IDs, error) {
+	ids := make(job.IDs, 0)
+	validationOptions, _ := lsctx.ValidationOptions(ctx)
+	if !validationOptions.EnableEnhancedValidation {
+		return ids, nil
+	}
+	mod, err := f.Store.ModuleRecordByPath(dir.Path())
+	if err != nil {
+		// not a module the feature indexes
+		return ids, nil
+	}
+	if mod.ModuleDiagnosticsState[globalAst.SemanticValidationSource] == op.OpStateUnknown {
+		return ids, nil
+	}
+	// after the jobs queued or running for the module, among them a
+	// validation that may have read the schemas before they were stored
+	pending, err := f.stateStore.JobStore.ListIncompleteJobsForDir(dir)
+	if err != nil {
+		return ids, err
+	}
+	path := dir.Path()
+	id, err := f.stateStore.JobStore.EnqueueJob(ctx, job.Job{
+		Dir: dir,
+		Func: func(ctx context.Context) error {
+			return jobs.SemanticValidation(ctx, f.fs, f.Store, f.rootFeature,
+				f.stateStore.ProviderSchemas, path, validationOptions, f.inputsSource())
+		},
+		Type:        op.OpTypeSemanticValidation.String(),
+		DependsOn:   pending,
+		IgnoreState: true,
+	})
+	if err != nil {
+		return ids, err
+	}
+	return append(ids, id), nil
+}
+
 func (f *ModulesFeature) removeIndexedModule(rawPath string) {
 	modHandle := document.DirHandleFromPath(rawPath)
 

@@ -165,11 +165,34 @@ var preferredExtensions = map[string][]string{
 	"templatefile": {".tftpl", ".tpl"},
 }
 
+// relativePathBase returns the directory that OpenTofu resolves a bare
+// relative file path of the module in dir from, the working directory:
+// the module's own directory when it is run as a root module, else the
+// directory of the root module that calls it when exactly one does. It
+// returns false when several roots, or roots that are not known, call it.
+func (svc *service) relativePathBase(dir string) (string, bool) {
+	fsys := svc.staticFS()
+	mod, err := staticval.LoadModule(fsys, dir)
+	if err != nil {
+		return "", false
+	}
+	staticval.AddCallers(fsys, mod, maxCallerNesting, svc.indexedCallers)
+	if mod.RootPath == "" {
+		return dir, true
+	}
+	roots, ok := staticval.CallingRoots(mod)
+	if !ok || len(roots) != 1 {
+		return "", false
+	}
+	return roots[0], true
+}
+
 // filePathCompletion completes the path in the string literal of a file
 // function's path argument at pos: the files and directories of the
-// directory typed so far, relative to the module directory. Directories
-// come after the files a function usually reads, and fileset gets
-// directories only.
+// directory typed so far, relative to the module directory for a path
+// that starts with path.module, else relative to the directory OpenTofu
+// resolves it from (see relativePathBase). Directories come after the
+// files a function usually reads, and fileset gets directories only.
 func (svc *service) filePathCompletion(doc *document.Document, pos hcl.Pos) (lsp.CompletionList, bool) {
 	list := lsp.CompletionList{Items: []lsp.CompletionItem{}}
 	if !bytes.Contains(doc.Text, []byte("file")) {
@@ -202,10 +225,26 @@ func (svc *service) filePathCompletion(doc *document.Document, pos hcl.Pos) (lsp
 		dirPart, partial = typed[:i+1], typed[i+1:]
 	}
 	var listDir string
+	fromRoot := ""
 	if filepath.IsAbs(dirPart) {
 		listDir = filepath.FromSlash(dirPart)
 	} else {
-		listDir = filepath.Join(doc.Dir.Path(), filepath.FromSlash(dirPart))
+		base := doc.Dir.Path()
+		if !anchored {
+			var ok bool
+			base, ok = svc.relativePathBase(base)
+			if !ok {
+				return list, true
+			}
+			if base != doc.Dir.Path() {
+				if rel, err := filepath.Rel(doc.Dir.Path(), base); err == nil {
+					fromRoot = filepath.ToSlash(rel)
+				} else {
+					fromRoot = base
+				}
+			}
+		}
+		listDir = filepath.Join(base, filepath.FromSlash(dirPart))
 	}
 	entries, err := svc.fs.ReadDir(listDir)
 	if err != nil {
@@ -265,6 +304,10 @@ func (svc *service) filePathCompletion(doc *document.Document, pos hcl.Pos) (lsp
 
 	for i, it := range items {
 		text := prefixSlash + it.name
+		detail := filepath.ToSlash(filepath.Join(dirPart, it.name))
+		if fromRoot != "" {
+			detail += " (in the root module " + fromRoot + ")"
+		}
 		kind := lsp.FileCompletion
 		var command *lsp.Command
 		if it.isDir {
@@ -277,7 +320,7 @@ func (svc *service) filePathCompletion(doc *document.Document, pos hcl.Pos) (lsp
 		list.Items = append(list.Items, lsp.CompletionItem{
 			Label:    it.name,
 			Kind:     kind,
-			Detail:   filepath.ToSlash(filepath.Join(dirPart, it.name)),
+			Detail:   detail,
 			SortText: fmt.Sprintf("%d%4d", it.rank, i),
 			TextEdit: &lsp.TextEdit{
 				Range:   lspRange,
