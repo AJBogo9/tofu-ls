@@ -12,10 +12,16 @@ type LanguageID string
 const (
 	OpenTofu     LanguageID = "opentofu"
 	OpenTofuVars LanguageID = "opentofu-vars"
+	// OpenTofuTest is the language of test files (*.tftest.hcl, *.tofutest.hcl)
+	OpenTofuTest LanguageID = "opentofu-test"
+	// OpenTofuMock is the language of mock data files (*.tfmock.hcl)
+	OpenTofuMock LanguageID = "opentofu-mock"
 	// Terraform - Some editors do not support language ID overrides which makes it difficult to use this language server
 	// We also need to accept language IDs of Terraform to circumvent this issue
 	Terraform     LanguageID = "terraform"
 	TerraformVars LanguageID = "terraform-vars"
+	TerraformTest LanguageID = "terraform-test"
+	TerraformMock LanguageID = "terraform-mock"
 )
 
 // ParseLanguageID parses a string into a LanguageID
@@ -27,6 +33,10 @@ func ParseLanguageID(id string) LanguageID {
 		return OpenTofu
 	case TerraformVars:
 		return OpenTofuVars
+	case TerraformTest:
+		return OpenTofuTest
+	case TerraformMock:
+		return OpenTofuMock
 	default:
 		return LanguageID(id)
 	}
@@ -44,6 +54,24 @@ func IsValidConfigLanguage(id string) bool {
 func IsValidVarsLanguage(id string) bool {
 	switch LanguageID(id) {
 	case OpenTofuVars, TerraformVars:
+		return true
+	default:
+		return false
+	}
+}
+
+func IsValidTestLanguage(id string) bool {
+	switch LanguageID(id) {
+	case OpenTofuTest, TerraformTest:
+		return true
+	default:
+		return false
+	}
+}
+
+func IsValidMockLanguage(id string) bool {
+	switch LanguageID(id) {
+	case OpenTofuMock, TerraformMock:
 		return true
 	default:
 		return false

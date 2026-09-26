@@ -25,6 +25,7 @@ import (
 	"github.com/opentofu/tofu-ls/internal/eventbus"
 	fmodules "github.com/opentofu/tofu-ls/internal/features/modules"
 	frootmodules "github.com/opentofu/tofu-ls/internal/features/rootmodules"
+	ftests "github.com/opentofu/tofu-ls/internal/features/tests"
 	fvariables "github.com/opentofu/tofu-ls/internal/features/variables"
 	"github.com/opentofu/tofu-ls/internal/filesystem"
 	"github.com/opentofu/tofu-ls/internal/job"
@@ -51,6 +52,7 @@ type Features struct {
 	Modules     *fmodules.ModulesFeature
 	RootModules *frootmodules.RootModulesFeature
 	Variables   *fvariables.VariablesFeature
+	Tests       *ftests.TestsFeature
 }
 
 type service struct {
@@ -617,18 +619,32 @@ func (svc *service) configureSessionDependencies(ctx context.Context, cfgOpts *s
 		variablesFeature.SetLogger(svc.logger)
 		variablesFeature.Start(svc.sessCtx)
 
+		testsFeature, err := ftests.NewTestsFeature(svc.eventBus, svc.stateStore, svc.fs,
+			modulesFeature)
+		if err != nil {
+			return err
+		}
+		testsFeature.SetLogger(svc.logger)
+		testsFeature.Start(svc.sessCtx)
+
 		svc.features = &Features{
 			Modules:     modulesFeature,
 			RootModules: rootModulesFeature,
 			Variables:   variablesFeature,
+			Tests:       testsFeature,
 		}
 	}
 
+	pathReaders := idecoder.PathReaderMap{
+		ilsp.OpenTofu.String():     svc.features.Modules,
+		ilsp.OpenTofuVars.String(): svc.features.Variables,
+	}
+	if svc.features.Tests != nil {
+		pathReaders[ilsp.OpenTofuTest.String()] = svc.features.Tests
+		pathReaders[ilsp.OpenTofuMock.String()] = svc.features.Tests
+	}
 	svc.pathReader = &idecoder.GlobalPathReader{
-		PathReaderMap: idecoder.PathReaderMap{
-			ilsp.OpenTofu.String():     svc.features.Modules,
-			ilsp.OpenTofuVars.String(): svc.features.Variables,
-		},
+		PathReaderMap: pathReaders,
 	}
 	svc.decoder = decoder.NewDecoder(svc.pathReader)
 	decoderContext := idecoder.DecoderContext(ctx)
@@ -710,6 +726,9 @@ func (svc *service) shutdown() {
 		}
 		if svc.features.Variables != nil {
 			svc.features.Variables.Stop()
+		}
+		if svc.features.Tests != nil {
+			svc.features.Tests.Stop()
 		}
 	}
 }

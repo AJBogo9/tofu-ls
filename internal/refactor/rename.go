@@ -22,6 +22,8 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	hcljson "github.com/hashicorp/hcl/v2/json"
 	tfmod "github.com/opentofu/opentofu-schema/module"
+	testsAst "github.com/opentofu/tofu-ls/internal/features/tests/ast"
+	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -841,7 +843,8 @@ func Rename(ctx context.Context, env Env, sym *Symbol, newName string, opts Opti
 		}
 		for _, po := range pathOrigins {
 			origin, ok := po.Origin.(reference.PathOrigin)
-			if !ok {
+			if !ok || ilsp.IsValidTestLanguage(po.Path.LanguageID) {
+				// renameInTestFiles renames the uses in test files
 				continue
 			}
 			file := filepath.Join(po.Path.Path, origin.Range.Filename)
@@ -1148,32 +1151,8 @@ type testRun struct {
 // A module block's source is relative to root, where tofu test runs.
 func testRuns(body *hclsyntax.Body, root string) []testRun {
 	runs := make([]testRun, 0)
-	for _, block := range body.Blocks {
-		if block.Type != "run" {
-			continue
-		}
-		run := testRun{block: block, module: filepath.Clean(root)}
-		if len(block.Labels) > 0 {
-			run.name = block.Labels[0]
-		}
-		for _, nested := range block.Body.Blocks {
-			if nested.Type != "module" {
-				continue
-			}
-			run.module = ""
-			src, ok := nested.Body.Attributes["source"]
-			if !ok {
-				continue
-			}
-			v, diags := src.Expr.Value(nil)
-			if diags.HasErrors() || !v.IsKnown() || v.IsNull() || v.Type() != cty.String {
-				continue
-			}
-			if s := v.AsString(); strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
-				run.module = filepath.Clean(filepath.Join(root, filepath.FromSlash(s)))
-			}
-		}
-		runs = append(runs, run)
+	for _, run := range testsAst.Runs(body, root) {
+		runs = append(runs, testRun{block: run.Block, name: run.Name, module: run.Module})
 	}
 	return runs
 }

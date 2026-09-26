@@ -18,6 +18,7 @@ import (
 	"github.com/opentofu/tofu-ls/internal/features/variables/jobs"
 	"github.com/opentofu/tofu-ls/internal/features/variables/state"
 	"github.com/opentofu/tofu-ls/internal/langserver/diagnostics"
+	"github.com/opentofu/tofu-ls/internal/lsp"
 	globalState "github.com/opentofu/tofu-ls/internal/state"
 )
 
@@ -91,7 +92,10 @@ func (f *VariablesFeature) Start(ctx context.Context) {
 				didOpenDone <- struct{}{}
 			case didChange := <-didChange:
 				// TODO? collect errors
-				f.didChange(didChange.Context, didChange.Dir)
+				// an edit of a test file leaves the module as it is
+				if !lsp.IsValidTestLanguage(didChange.LanguageID) && !lsp.IsValidMockLanguage(didChange.LanguageID) {
+					f.didChange(didChange.Context, didChange.Dir)
+				}
 				didChangeDone <- struct{}{}
 			case didChangeWatched := <-didChangeWatched:
 				// TODO? collect errors

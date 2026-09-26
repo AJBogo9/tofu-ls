@@ -23,6 +23,7 @@ import (
 	"github.com/opentofu/tofu-ls/internal/features/modules/jobs"
 	"github.com/opentofu/tofu-ls/internal/features/modules/state"
 	"github.com/opentofu/tofu-ls/internal/langserver/diagnostics"
+	"github.com/opentofu/tofu-ls/internal/lsp"
 	"github.com/opentofu/tofu-ls/internal/registry"
 	globalState "github.com/opentofu/tofu-ls/internal/state"
 )
@@ -100,7 +101,10 @@ func (f *ModulesFeature) Start(ctx context.Context) {
 				didOpenDone <- struct{}{}
 			case didChange := <-didChange:
 				// TODO? collect errors
-				f.didChange(didChange.Context, didChange.Dir)
+				// an edit of a test file leaves the module as it is
+				if !lsp.IsValidTestLanguage(didChange.LanguageID) && !lsp.IsValidMockLanguage(didChange.LanguageID) {
+					f.didChange(didChange.Context, didChange.Dir)
+				}
 				didChangeDone <- struct{}{}
 			case didChangeWatched := <-didChangeWatched:
 				// TODO? collect errors
@@ -178,6 +182,12 @@ func (f *ModulesFeature) ModuleInputs(modPath string) (map[string]tfmod.Variable
 	}
 
 	return mod.Meta.Variables, nil
+}
+
+// LocalModuleMeta returns the metadata of the module at modPath, e.g.
+// for the test files which run it.
+func (f *ModulesFeature) LocalModuleMeta(modPath string) (*tfmod.Meta, error) {
+	return f.Store.LocalModuleMeta(modPath)
 }
 
 func (f *ModulesFeature) AppendCompletionHooks(srvCtx context.Context, decoderContext decoder.DecoderContext) {
