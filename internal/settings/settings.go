@@ -107,9 +107,20 @@ type Values struct {
 	// VarFiles maps module directories (paths or file URIs) to their
 	// -var-file files, relative to the module and in order.
 	VarFiles map[string][]string `mapstructure:"varFiles"`
+	// Vars maps module directories to their -var options, in order.
+	Vars map[string][]VarOption `mapstructure:"vars"`
 	// ReadEnvironment reads the TF_VAR_ variables of the language
 	// server's environment.
 	ReadEnvironment bool `mapstructure:"readEnvironment"`
+}
+
+// VarOption is a -var option of a module's inputs.
+type VarOption struct {
+	// Raw is the option's argument, name=value.
+	Raw string `mapstructure:"raw" json:"raw"`
+	// After is how many of the module's -var-file files come before the
+	// option on the command line.
+	After int `mapstructure:"after" json:"after"`
 }
 
 type Tofu struct {

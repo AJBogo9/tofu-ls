@@ -107,6 +107,9 @@ func (f *ModulesFeature) Start(ctx context.Context) {
 	didChangeWatchedDone := make(chan struct{}, 10)
 	didChangeWatched := f.eventbus.OnDidChangeWatched("feature.modules", didChangeWatchedDone)
 
+	schemasChangeDone := make(chan struct{}, 10)
+	schemasChange := f.eventbus.OnProviderSchemasChange("feature.modules", schemasChangeDone)
+
 	go func() {
 		for {
 			select {
@@ -130,6 +133,10 @@ func (f *ModulesFeature) Start(ctx context.Context) {
 				// TODO? collect errors
 				f.didChangeWatched(didChangeWatched.Context, didChangeWatched.RawPath, didChangeWatched.ChangeType, didChangeWatched.IsDir)
 				didChangeWatchedDone <- struct{}{}
+			case schemasChange := <-schemasChange:
+				// TODO? collect errors
+				f.providerSchemasChange(schemasChange.Context, schemasChange.Dir)
+				schemasChangeDone <- struct{}{}
 
 			case <-ctx.Done():
 				return

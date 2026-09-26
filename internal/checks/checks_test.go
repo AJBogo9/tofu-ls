@@ -1110,6 +1110,46 @@ locals { fixed = "x" }
 			want: []string{`main.tf:1:1-1:17 validation-failed Invalid value for variable`},
 		},
 		{
+			name:   "a -var value, on the declaration",
+			only:   "conditions",
+			inputs: staticval.Inputs{Vars: []staticval.VarFlag{{Raw: "stage=qa"}}},
+			files: map[string]string{
+				"main.tf":          stage,
+				"terraform.tfvars": "",
+			},
+			want: []string{`main.tf:1:1-1:17 validation-failed Invalid value for variable`},
+		},
+		{
+			// tofu plan -var-file=envs/prd.tfvars -var stage=prod accepts
+			// the plan
+			name: "a -var value that overrides a failing value",
+			only: "conditions",
+			inputs: staticval.Inputs{
+				VarFiles: []string{"envs/prd.tfvars"},
+				Vars:     []staticval.VarFlag{{Raw: "stage=prod", After: 1}},
+			},
+			files: map[string]string{
+				"main.tf":          stage,
+				"terraform.tfvars": "stage = \"prd\"\n",
+				"envs/prd.tfvars":  "stage = \"prd\"\n",
+			},
+			want: []string{},
+		},
+		{
+			// tofu plan -var stage=prod -var-file=envs/prd.tfvars does not
+			name: "a failing value after a -var value",
+			only: "conditions",
+			inputs: staticval.Inputs{
+				VarFiles: []string{"envs/prd.tfvars"},
+				Vars:     []staticval.VarFlag{{Raw: "stage=prod"}},
+			},
+			files: map[string]string{
+				"main.tf":         stage,
+				"envs/prd.tfvars": "stage = \"prd\"\n",
+			},
+			want: []string{`envs/prd.tfvars:1:9-1:14 validation-failed Invalid value for variable`},
+		},
+		{
 			name: "module call arguments and conditions",
 			only: "conditions",
 			files: map[string]string{

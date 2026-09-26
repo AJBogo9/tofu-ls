@@ -79,7 +79,7 @@ func (ev *Evaluator) rootFailures() []VariableFailure {
 			f.Source, f.Range = "default", v.DefaultRange
 		default:
 			f.Source, f.Kind, f.Range = a.File, a.Kind, a.ValueRange
-			if a.Kind == FromEnvironment {
+			if a.Kind == FromEnvironment || a.Kind == FromCommandLine {
 				f.Range = v.DeclRange
 			}
 		}

@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"github.com/opentofu/tofu-ls/internal/document"
+	"github.com/opentofu/tofu-ls/internal/eventbus"
 	"github.com/opentofu/tofu-ls/internal/features/rootmodules/ast"
 	"github.com/opentofu/tofu-ls/internal/features/rootmodules/jobs"
 	"github.com/opentofu/tofu-ls/internal/job"
@@ -107,6 +108,10 @@ func (f *RootModulesFeature) didOpen(ctx context.Context, dir document.DirHandle
 		},
 		Type:      op.OpTypeObtainSchema.String(),
 		DependsOn: job.IDs{pSchemaVerId},
+		Defer: func(_ context.Context, jobErr error) (job.IDs, error) {
+			f.schemasObtained(ctx, dir, jobErr)
+			return job.IDs{}, nil
+		},
 	})
 	if err != nil {
 		return ids, err
@@ -148,6 +153,10 @@ func (f *RootModulesFeature) pluginLockChange(ctx context.Context, dir document.
 		IgnoreState: true,
 		Type:        op.OpTypeObtainSchema.String(),
 		DependsOn:   job.IDs{pSchemaVerId},
+		Defer: func(_ context.Context, jobErr error) (job.IDs, error) {
+			f.schemasObtained(ctx, dir, jobErr)
+			return job.IDs{}, nil
+		},
 	})
 	if err != nil {
 		return ids, err
@@ -155,6 +164,20 @@ func (f *RootModulesFeature) pluginLockChange(ctx context.Context, dir document.
 	ids = append(ids, pSchemaId)
 
 	return ids, nil
+}
+
+// schemasObtained tells the other features that the provider schemas of
+// the root module in dir were obtained, unless the job that obtains them
+// failed or found them obtained already (jobErr). ctx is the context of
+// the request the job was scheduled for.
+func (f *RootModulesFeature) schemasObtained(ctx context.Context, dir document.DirHandle, jobErr error) {
+	if jobErr != nil {
+		return
+	}
+	f.eventbus.ProviderSchemasChange(eventbus.ProviderSchemasChangeEvent{
+		Context: ctx,
+		Dir:     dir,
+	})
 }
 
 func (f *RootModulesFeature) manifestChange(ctx context.Context, dir document.DirHandle, changeType protocol.FileChangeType) (job.IDs, error) {

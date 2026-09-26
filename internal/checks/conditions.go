@@ -87,7 +87,7 @@ func (c *checker) validationFailure(f staticval.VariableFailure) {
 		detail = fmt.Sprintf("%s: %s", listCalls(f.Calls), detail)
 	case f.Source == "default" && len(f.Calls) > 0:
 		detail = fmt.Sprintf("%s (the default, which %s leaves unset)", detail, listCalls(f.Calls))
-	case f.Kind == staticval.FromEnvironment:
+	case f.Kind == staticval.FromEnvironment || f.Kind == staticval.FromCommandLine:
 		detail = fmt.Sprintf("the value of %s fails validation: %s", f.Source, detail)
 	}
 	data := map[string]interface{}{"variable": f.Variable}

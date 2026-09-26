@@ -20,3 +20,12 @@ var moduleValidators = []validator.Validator{
 	validator.UnexpectedAttribute{},
 	validator.UnexpectedBlock{},
 }
+
+// validatorsForModule returns the validators of a module whose calls
+// named in registryCalls have their inputs from the registry's data.
+func validatorsForModule(registryCalls map[string]bool) []validator.Validator {
+	if len(registryCalls) == 0 {
+		return moduleValidators
+	}
+	return append([]validator.Validator{validations.RegistryModuleInputs{Calls: registryCalls}}, moduleValidators...)
+}

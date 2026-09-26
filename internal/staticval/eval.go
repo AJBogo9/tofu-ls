@@ -188,18 +188,20 @@ const (
 	FromVarFile
 	// FromEnvironment is a TF_VAR_ environment variable.
 	FromEnvironment
+	// FromCommandLine is a -var option.
+	FromCommandLine
 )
 
-// Assignment is a value given to a variable in a tfvars file, or in a
-// TF_VAR_ environment variable.
+// Assignment is a value given to a variable in a tfvars file, in a
+// TF_VAR_ environment variable or with a -var option.
 type Assignment struct {
-	// File is the tfvars file name, or the environment variable's name
-	// (TF_VAR_<name>).
+	// File is the tfvars file name, the environment variable's name
+	// (TF_VAR_<name>), or the -var option without its value (-var <name>).
 	File  string
 	Kind  AssignmentKind
 	Range hcl.Range
 	// ValueRange is the value's expression; empty for an environment
-	// variable.
+	// variable or a -var option.
 	ValueRange hcl.Range
 	Value      cty.Value
 	// Err is set when the value does not convert to the variable's type.
@@ -398,7 +400,7 @@ func (ev *Evaluator) decode() {
 	}
 
 	// Only the directory's own files are loaded automatically; -var-file
-	// files follow them, in the order given.
+	// files and -var options follow them, in the order given.
 	var names []string
 	for _, name := range mapKeys(ev.mod.VarsFiles) {
 		if !strings.Contains(name, "/") {
@@ -420,10 +422,21 @@ func (ev *Evaluator) decode() {
 	} else {
 		ev.decodeEnvVars()
 	}
+	// the -var options in the order of the command line, among the
+	// -var-file files
+	varFlags := append([]VarFlag(nil), ev.mod.Vars...)
+	sort.SliceStable(varFlags, func(i, j int) bool { return varFlags[i].After < varFlags[j].After })
+	decodeFlagsBefore := func(files int) {
+		for len(varFlags) > 0 && varFlags[0].After <= files {
+			ev.decodeVarFlag(varFlags[0].Raw)
+			varFlags = varFlags[1:]
+		}
+	}
 	for i, name := range varsFiles {
 		kind := FromAutoFile
 		if i >= autoCount {
 			kind = FromVarFile
+			decodeFlagsBefore(i - autoCount)
 		}
 		if msg := ev.mod.VarsFileErrors[name]; msg != "" {
 			ev.refuse(name, msg)
@@ -456,6 +469,9 @@ func (ev *Evaluator) decode() {
 			}
 			v.Assignments = append(v.Assignments, a)
 		}
+	}
+	if ev.mod.RootPath == "" {
+		decodeFlagsBefore(len(ev.mod.VarFiles))
 	}
 
 	parents := make(map[*Module]*Evaluator)
@@ -506,9 +522,7 @@ func (ev *Evaluator) decode() {
 }
 
 // decodeEnvVars gives each declared variable the value of its TF_VAR_
-// environment variable, which every tfvars file overrides. OpenTofu takes
-// the value of a variable with a primitive type, or without a type, as a
-// literal string, and parses any other as an HCL expression.
+// environment variable, which every tfvars file overrides.
 func (ev *Evaluator) decodeEnvVars() {
 	for _, name := range mapKeys(ev.mod.EnvVars) {
 		v, ok := ev.vars[name]
@@ -517,25 +531,54 @@ func (ev *Evaluator) decodeEnvVars() {
 			// variables
 			continue
 		}
-		raw := ev.mod.EnvVars[name]
-		envName := "TF_VAR_" + name
-		val := cty.StringVal(raw)
-		if v.TypeSource != "" && !v.Type.IsPrimitiveType() {
-			expr, diags := hclsyntax.ParseExpression([]byte(raw), envName, hcl.InitialPos)
-			if !diags.HasErrors() {
-				val, diags = expr.Value(nil)
-			}
-			if diags.HasErrors() {
-				ev.refuse(envName, diagSummary(diags))
-				continue
-			}
-		}
-		a := Assignment{File: envName, Kind: FromEnvironment, Range: v.DeclRange, Value: val}
-		if _, err := v.convert(val); err != nil {
-			a.Err = err.Error()
-		}
-		v.Assignments = append(v.Assignments, a)
+		ev.assignRaw(v, ev.mod.EnvVars[name], "TF_VAR_"+name, FromEnvironment)
 	}
+}
+
+// decodeVarFlag gives a declared variable the value of a -var option
+// (name=value). OpenTofu refuses to run when the option has no equals
+// sign, spaces around the name, or names a variable that is not
+// declared. The value is never quoted in a message, since it may be a
+// secret.
+func (ev *Evaluator) decodeVarFlag(raw string) {
+	name, value, ok := strings.Cut(raw, "=")
+	switch {
+	case !ok || name == "":
+		ev.refuse("-var", "an option must be a variable name and a value separated by an equals sign")
+		return
+	case strings.TrimSpace(name) != name:
+		ev.refuse("-var "+strings.TrimSpace(name), "the variable name has spaces around it")
+		return
+	}
+	v, declared := ev.vars[name]
+	if !declared {
+		ev.refuse("-var "+name, "no variable of that name is declared")
+		return
+	}
+	ev.assignRaw(v, value, "-var "+name, FromCommandLine)
+}
+
+// assignRaw gives v the raw string of a TF_VAR_ variable or a -var option,
+// named source. OpenTofu takes the value of a variable with a primitive
+// type, or without a type, as a literal string, and parses any other as
+// an HCL expression, refusing to run when it does not parse.
+func (ev *Evaluator) assignRaw(v *Variable, raw, source string, kind AssignmentKind) {
+	val := cty.StringVal(raw)
+	if v.TypeSource != "" && !v.Type.IsPrimitiveType() {
+		expr, diags := hclsyntax.ParseExpression([]byte(raw), source, hcl.InitialPos)
+		if !diags.HasErrors() {
+			val, diags = expr.Value(nil)
+		}
+		if diags.HasErrors() {
+			ev.refuse(source, diagSummary(diags))
+			return
+		}
+	}
+	a := Assignment{File: source, Kind: kind, Range: v.DeclRange, Value: val}
+	if _, err := v.convert(val); err != nil {
+		a.Err = err.Error()
+	}
+	v.Assignments = append(v.Assignments, a)
 }
 
 // hideDefaults makes every variable of a root module whose value is only
@@ -1088,9 +1131,9 @@ func (v *Variable) convert(val cty.Value) (cty.Value, error) {
 }
 
 // Effective returns the value OpenTofu would use with the module's
-// inputs (its -var-file files and TF_VAR_ variables, see Inputs) and no
-// -var, and where it comes from: a tfvars file name, TF_VAR_<name>, or
-// "default".
+// inputs (its -var-file files, -var options and TF_VAR_ variables, see
+// Inputs), and where it comes from: a tfvars file name, TF_VAR_<name>,
+// -var <name>, or "default".
 func (v *Variable) Effective() (cty.Value, string, bool) {
 	val, a, ok := v.effective()
 	switch {

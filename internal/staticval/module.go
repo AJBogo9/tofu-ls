@@ -53,6 +53,10 @@ type Module struct {
 	// slash-separated, in the order given (see Inputs).
 	VarFiles []string
 
+	// Vars are the -var options, each after the number of VarFiles that
+	// come before it on the command line (see Inputs).
+	Vars []VarFlag
+
 	// EnvVars are the TF_VAR_ environment variables by variable name.
 	EnvVars map[string]string
 
@@ -207,9 +211,20 @@ func LoadModule(fsys FS, dir string) (*Module, error) {
 	return mod, nil
 }
 
-// applyInputs reads the -var-file files of in and keeps its environment
-// variables. A file that cannot be read is an error, as in OpenTofu.
+// applyInputs reads the -var-file files of in and keeps its -var options
+// and environment variables. A file that cannot be read is an error, as
+// in OpenTofu.
 func (m *Module) applyInputs(fsys FS, in Inputs) {
+	for _, v := range in.Vars {
+		// count the files kept among those before the option
+		after := 0
+		for i := 0; i < v.After && i < len(in.VarFiles); i++ {
+			if _, ok := CleanVarFile(in.VarFiles[i]); ok {
+				after++
+			}
+		}
+		m.Vars = append(m.Vars, VarFlag{Raw: v.Raw, After: after})
+	}
 	for _, f := range in.VarFiles {
 		name, ok := CleanVarFile(f)
 		if !ok {
@@ -243,6 +258,13 @@ func (m *Module) applyInputs(fsys FS, in Inputs) {
 // chosen for it, or it configures a backend. A directory without any of
 // these may be a library module (initialized for its examples or tests)
 // whose callers set what its defaults leave open.
+//
+// RunAsRoot and IsLibraryRoot are not opposites, and a module can be
+// neither. RunAsRoot asks for evidence of a root before its default
+// values may raise errors (diagnostics must be certain, so no evidence
+// means no error). IsLibraryRoot asks for evidence of a library before
+// the value hints hide its defaults (hints are shown unless the defaults
+// are likely placeholders). Both count a backend (see hasBackend).
 func (m *Module) RunAsRoot() bool {
 	for name := range m.VarsFiles {
 		if IsAutoVarsFile(name) && !strings.Contains(name, "/") {
@@ -252,22 +274,7 @@ func (m *Module) RunAsRoot() bool {
 	if len(m.VarFiles) > 0 {
 		return true
 	}
-	for _, f := range m.Files {
-		content, _, _ := f.Body.PartialContent(&hcl.BodySchema{Blocks: []hcl.BlockHeaderSchema{{Type: "terraform"}}})
-		if content == nil {
-			continue
-		}
-		for _, tb := range content.Blocks {
-			inner, _, _ := tb.Body.PartialContent(&hcl.BodySchema{Blocks: []hcl.BlockHeaderSchema{
-				{Type: "backend", LabelNames: []string{"type"}},
-				{Type: "cloud"},
-			}})
-			if inner != nil && len(inner.Blocks) > 0 {
-				return true
-			}
-		}
-	}
-	return false
+	return m.hasBackend()
 }
 
 // IsVarFile reports whether name is one of the module's -var-file files.
@@ -364,6 +371,11 @@ func usedAsRoot(fsys FS, mod *Module) bool {
 // A .terraform directory does not make it a root here: library authors run
 // tofu init too, to validate. indexed is the language server's index of
 // callers, as for AddCallers, and may be nil.
+//
+// It needs evidence of a library before the value hints hide defaults,
+// where RunAsRoot needs evidence of a root before defaults may raise
+// errors; a module with neither kind of evidence keeps its default hints
+// and raises no errors from its defaults.
 func IsLibraryRoot(fsys FS, mod *Module, indexed func(dir string) []Caller) bool {
 	if mod.RootPath != "" || len(mod.VarsFiles) > 0 || len(mod.VarsFileErrors) > 0 || mod.hasBackend() {
 		return false
@@ -391,7 +403,8 @@ func IsLibraryRoot(fsys FS, mod *Module, indexed func(dir string) []Caller) bool
 }
 
 // hasBackend reports whether the module configures a backend or cloud
-// block, which only a root module does.
+// block, which only a root module does. It is evidence of a root for
+// both RunAsRoot and IsLibraryRoot.
 func (m *Module) hasBackend() bool {
 	for _, f := range m.Files {
 		content, _, _ := f.Body.PartialContent(&hcl.BodySchema{
@@ -482,6 +495,47 @@ func AddCallers(fsys FS, mod *Module, nesting int, indexed func(dir string) []Ca
 			mod.RootPath = parent.RootPath
 		}
 	}
+}
+
+// CallingRoots returns the directories of the root modules that run mod
+// through the callers AddCallers found for it, in lexical order: mod's
+// own directory when it has no callers, the root of the directory it is
+// installed in below .terraform/modules. It returns false when the roots
+// are not all known, as when callers were too deeply nested to resolve.
+// OpenTofu resolves a relative file path from the root's directory, the
+// working directory.
+func CallingRoots(mod *Module) ([]string, bool) {
+	roots := make(map[string]bool)
+	if !callingRoots(mod, roots) {
+		return nil, false
+	}
+	dirs := make([]string, 0, len(roots))
+	for dir := range roots {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	return dirs, true
+}
+
+func callingRoots(mod *Module, roots map[string]bool) bool {
+	if root, ok := InstalledRoot(mod.Path); ok {
+		roots[root] = true
+		return true
+	}
+	if len(mod.Callers) == 0 {
+		if mod.RootPath != "" {
+			// called, by callers that were not resolved
+			return false
+		}
+		roots[mod.Path] = true
+		return true
+	}
+	for _, c := range mod.Callers {
+		if !callingRoots(c.Parent, roots) {
+			return false
+		}
+	}
+	return true
 }
 
 // isBelow reports whether dir is a subdirectory of parent.

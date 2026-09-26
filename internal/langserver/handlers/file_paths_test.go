@@ -152,3 +152,59 @@ func TestFilePaths_completion(t *testing.T) {
 		})
 	}
 }
+
+// TestFilePaths_completionInCalledModule checks that a bare relative path
+// in a module that other modules call is completed from the directory
+// OpenTofu resolves it from, the root module's, and not from the module's
+// own directory: from the only root that calls it, or not at all when
+// several do. Paths from path.module stay relative to the module.
+func TestFilePaths_completionInCalledModule(t *testing.T) {
+	testCases := []struct {
+		name      string
+		tree      string
+		line, col int
+		want      []string
+	}{
+		{"one root", "one-root", 1, 12, []string{
+			"main.tf 17 main.tf 1:12-12",
+			"root.txt 17 root.txt 1:12-12",
+			"modules 19 modules/ 1:12-12",
+		}},
+		{"one root, path.module", "one-root", 2, 27, []string{
+			"app.txt 17 app.txt 2:27-27",
+			"main.tf 17 main.tf 2:27-27",
+		}},
+		{"two roots", "two-roots", 1, 12, []string{}},
+		{"two roots, path.module", "two-roots", 2, 27, []string{
+			"app.txt 17 app.txt 2:27-27",
+			"main.tf 17 main.tf 2:27-27",
+		}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			request := testSession(t, filepath.Join("testdata", "file-paths-called", tc.tree, "modules", "app"), "{}", "{}")
+			result, err := request("textDocument/completion", fmt.Sprintf(`{
+	"textDocument": {"uri": "main.tf"},
+	"position": {"line": %d, "character": %d}
+}`, tc.line, tc.col))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var list lsp.CompletionList
+			if err := json.Unmarshal(result, &list); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]string, 0)
+			for _, item := range list.Items {
+				got = append(got, fmt.Sprintf("%s %d %s %d:%d-%d", item.Label, item.Kind, item.TextEdit.NewText,
+					item.TextEdit.Range.Start.Line, item.TextEdit.Range.Start.Character, item.TextEdit.Range.End.Character))
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatalf("unexpected items: %s", diff)
+			}
+			if tc.name == "one root" && list.Items[1].Detail != "root.txt (in the root module ../..)" {
+				t.Fatalf("the detail does not name the root: %q", list.Items[1].Detail)
+			}
+		})
+	}
+}
