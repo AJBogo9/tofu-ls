@@ -10,13 +10,16 @@
 package staticval
 
 import (
+	"bytes"
 	"io/fs"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/hcl/v2"
-	"github.com/hashicorp/hcl/v2/hclparse"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
+	hcljson "github.com/hashicorp/hcl/v2/json"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -71,6 +74,20 @@ func IsConfigFile(name string) bool {
 	return false
 }
 
+// IsOverrideFile reports whether a configuration file is an override file
+// (override.tf, *_override.tf and their .tofu and JSON forms), which
+// OpenTofu merges into the primary declarations after reading every other
+// file.
+func IsOverrideFile(name string) bool {
+	for _, ext := range []string{".tf.json", ".tofu.json", ".tf", ".tofu"} {
+		if strings.HasSuffix(name, ext) {
+			base := strings.TrimSuffix(name, ext)
+			return base == "override" || strings.HasSuffix(base, "_override")
+		}
+	}
+	return false
+}
+
 // IsAutoVarsFile reports whether OpenTofu loads a tfvars file without a
 // -var-file flag.
 func IsAutoVarsFile(name string) bool {
@@ -119,7 +136,6 @@ func LoadModule(fsys FS, dir string) (*Module, error) {
 		VarsFiles: make(map[string]*hcl.File),
 		Workspace: "default",
 	}
-	parser := hclparse.NewParser()
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -134,12 +150,7 @@ func LoadModule(fsys FS, dir string) (*Module, error) {
 		if err != nil {
 			continue
 		}
-		var f *hcl.File
-		if strings.HasSuffix(name, ".json") {
-			f, _ = parser.ParseJSON(src, filepath.Join(dir, name))
-		} else {
-			f, _ = parser.ParseHCL(src, filepath.Join(dir, name))
-		}
+		f := parseFile(filepath.Join(dir, name), src)
 		if f == nil {
 			continue
 		}
@@ -147,6 +158,19 @@ func LoadModule(fsys FS, dir string) (*Module, error) {
 			mod.Files[name] = f
 		} else {
 			mod.VarsFiles[name] = f
+		}
+	}
+
+	// OpenTofu ignores a .tf file when a .tofu file of the same name
+	// exists, and likewise for the JSON forms.
+	for name := range mod.Files {
+		for _, pair := range [][2]string{{".tf.json", ".tofu.json"}, {".tf", ".tofu"}} {
+			if strings.HasSuffix(name, pair[0]) {
+				if _, ok := mod.Files[strings.TrimSuffix(name, pair[0])+pair[1]]; ok {
+					delete(mod.Files, name)
+				}
+				break
+			}
 		}
 	}
 
@@ -159,15 +183,73 @@ func LoadModule(fsys FS, dir string) (*Module, error) {
 	return mod, nil
 }
 
-// sortedFileNames returns the configuration file names in lexical order,
-// which is the order OpenTofu merges them in.
+// parsedFiles caches the parsed files by path: every hover and inlay
+// hint request loads the module and its callers again, and parsing is
+// most of that work. An entry is used only while the content is the same.
+var parsedFiles = struct {
+	sync.Mutex
+	files map[string]*hcl.File
+}{files: make(map[string]*hcl.File)}
+
+// maxParsedFiles bounds the cache; it is emptied when full.
+const maxParsedFiles = 2048
+
+// parseFile parses a configuration or tfvars file, native or JSON, keeping
+// whatever the parser recovered from a file with errors. The returned
+// file is shared and must not be modified.
+func parseFile(path string, src []byte) *hcl.File {
+	parsedFiles.Lock()
+	f, ok := parsedFiles.files[path]
+	parsedFiles.Unlock()
+	if ok && bytes.Equal(f.Bytes, src) {
+		return f
+	}
+	if strings.HasSuffix(path, ".json") {
+		f, _ = hcljson.Parse(src, path)
+	} else {
+		f, _ = hclsyntax.ParseConfig(src, path, hcl.InitialPos)
+	}
+	if f == nil {
+		return nil
+	}
+	parsedFiles.Lock()
+	if len(parsedFiles.files) >= maxParsedFiles {
+		parsedFiles.files = make(map[string]*hcl.File)
+	}
+	parsedFiles.files[path] = f
+	parsedFiles.Unlock()
+	return f
+}
+
+// sortedFileNames returns the configuration file names in the order
+// OpenTofu merges them in: the primary files in lexical order, then the
+// override files in lexical order.
 func (m *Module) sortedFileNames() []string {
 	names := make([]string, 0, len(m.Files))
 	for n := range m.Files {
 		names = append(names, n)
 	}
-	sort.Strings(names)
+	sort.Slice(names, func(i, j int) bool {
+		oi, oj := IsOverrideFile(names[i]), IsOverrideFile(names[j])
+		if oi != oj {
+			return oj
+		}
+		return names[i] < names[j]
+	})
 	return names
+}
+
+// usedAsRoot reports whether a module directory is run as a root module:
+// it has tfvars files that OpenTofu loads automatically, or has been
+// initialized.
+func usedAsRoot(fsys FS, mod *Module) bool {
+	if len(mod.VarsFiles) > 0 {
+		return true
+	}
+	// The language server's filesystem lists a missing directory as
+	// empty instead of failing.
+	entries, err := fsys.ReadDir(filepath.Join(mod.Path, ".terraform"))
+	return err == nil && len(entries) > 0
 }
 
 // maxCallerDepth is how many directories up AddCallers looks for module
@@ -187,6 +269,12 @@ func AddCallers(fsys FS, mod *Module, nesting int, indexed func(dir string) []Ca
 			mod.RootPath = root
 		}
 	}()
+	if _, installed := InstalledRoot(mod.Path); !installed && usedAsRoot(fsys, mod) {
+		// A directory with its own tfvars or .terraform is run as a root
+		// module, for example a module whose examples/ call it; its
+		// values come from its tfvars, whichever callers are indexed.
+		return
+	}
 	callers := LocalCallers(fsys, mod.Path, maxCallerDepth)
 	if indexed != nil {
 		callers = append(callers, indexed(mod.Path)...)

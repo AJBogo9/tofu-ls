@@ -54,6 +54,9 @@ type Result struct {
 	// "random_pet.name.id" or "var.project", a function call such as
 	// "timestamp()", or an error message.
 	Reason string
+	// Detail explains the reason further, for example why a data source
+	// is read during apply.
+	Detail string
 }
 
 // IsKnown reports whether the whole value is known.
@@ -145,7 +148,20 @@ type Evaluator struct {
 	host *Env
 	// moduleOutputs caches the evaluated outputs of each module call.
 	moduleOutputs map[string]map[string]Result
+	// moduleInstances caches the outputs of each module call with
+	// for_each (an object by instance key) or count (a tuple), or
+	// cty.NilVal when they could not be evaluated.
+	moduleInstances map[string]cty.Value
+	// depth is how many module calls deep this evaluator is below the
+	// evaluator that the hover started from.
+	depth int
+	// readingData guards against data sources that depend on each other.
+	readingData map[string]bool
 }
+
+// maxModuleDepth caps how deep module outputs are evaluated through
+// nested module calls.
+const maxModuleDepth = 4
 
 // SetEnv lets the evaluator load child modules, so that references to
 // module outputs evaluate to the output's value for that call.
@@ -155,17 +171,26 @@ func (ev *Evaluator) SetEnv(host Env) {
 
 // NewEvaluator decodes the variables and locals of mod.
 func NewEvaluator(mod *Module) *Evaluator {
+	// OpenTofu resolves relative file paths against the working
+	// directory, which is the root module, and path.module is relative to
+	// it. Files may be read from the root's tree and the module's own.
+	baseDir := mod.Path
+	if mod.RootPath != "" {
+		baseDir = mod.RootPath
+	}
 	ev := &Evaluator{
 		mod:          mod,
-		funcs:        earlydecoder.StaticFunctions(mod.Path),
+		funcs:        earlydecoder.StaticFunctions(baseDir, mod.Path),
 		vars:         make(map[string]*Variable),
 		locals:       make(map[string]*Local),
 		varValues:    make(map[string]cty.Value),
 		varCauses:    make(map[string]Result),
 		localResults: make(map[string]Result),
 		evaluating:   make(map[string]bool),
+		readingData:  make(map[string]bool),
 
-		moduleOutputs: make(map[string]map[string]Result),
+		moduleOutputs:   make(map[string]map[string]Result),
+		moduleInstances: make(map[string]cty.Value),
 	}
 	ev.decode()
 	return ev
@@ -261,8 +286,14 @@ func (ev *Evaluator) decode() {
 		}
 	}
 
+	parents := make(map[*Module]*Evaluator)
 	for _, c := range ev.mod.Callers {
-		parentEv := NewEvaluator(c.Parent)
+		// several calls in one parent share its evaluator
+		parentEv, ok := parents[c.Parent]
+		if !ok {
+			parentEv = NewEvaluator(c.Parent)
+			parents[c.Parent] = parentEv
+		}
 		block := parentEv.findModuleCall(c.Name)
 		if block == nil {
 			continue
@@ -298,6 +329,12 @@ func (ev *Evaluator) decode() {
 // callValueFor evaluates the value that the module call block of this
 // (parent) module passes to the child variable v.
 func (ev *Evaluator) callValueFor(block *hclsyntax.Block, v *Variable, childPath string) CallValue {
+	return ev.callValueForInstance(block, v, childPath, nil)
+}
+
+// callValueForInstance is callValueFor for one instance of a call with
+// for_each or count, whose each or count values are given.
+func (ev *Evaluator) callValueForInstance(block *hclsyntax.Block, v *Variable, childPath string, each map[string]cty.Value) CallValue {
 	cv := CallValue{
 		Call: "module." + block.Labels[0],
 		File: relPath(childPath, block.Range().Filename),
@@ -305,10 +342,10 @@ func (ev *Evaluator) callValueFor(block *hclsyntax.Block, v *Variable, childPath
 	attr, set := block.Body.Attributes[v.Name]
 	cv.Set = set
 	switch {
-	case set && (block.Body.Attributes["for_each"] != nil || block.Body.Attributes["count"] != nil):
-		cv.Result = Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: cv.Call + " has several instances (for_each or count)"}
+	case set && each == nil && (block.Body.Attributes["for_each"] != nil || block.Body.Attributes["count"] != nil):
+		cv.Result = Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: cv.Call + " differs per instance (for_each or count)"}
 	case set:
-		cv.Result = ev.Eval(attr.Expr, nil)
+		cv.Result = ev.Eval(attr.Expr, each)
 		if cv.Result.IsKnown() {
 			val, err := v.convert(cv.Result.Value)
 			if err != nil {
@@ -350,42 +387,62 @@ func (v *Variable) callValue() (cty.Value, bool) {
 			return cty.NilVal, false
 		}
 	}
+	for _, cv := range v.CallValues {
+		// Equal content is still sensitive when any call marks it so.
+		if cv.Result.IsSensitive() && !val.ContainsMarked() {
+			val = val.Mark(SensitiveMark)
+		}
+	}
 	return val, true
 }
 
-// callCause explains an unknown child module variable: the first unknown
-// call value, or PerCall when the calls disagree.
+// callCause explains an unknown child module variable: the unknown value
+// of its only module call, or PerCall when several calls disagree or some
+// of them are unknown, so that the hover lists the value of each call.
 func (v *Variable) callCause() (Result, bool) {
 	if len(v.CallValues) == 0 {
 		return Result{}, false
 	}
-	for _, cv := range v.CallValues {
-		if !cv.Result.IsKnown() {
-			return cv.Result, true
-		}
+	if len(v.CallValues) == 1 && !v.CallValues[0].Result.IsKnown() {
+		return v.CallValues[0].Result, true
 	}
 	return Result{Kind: PerCall, Reason: "var." + v.Name}, true
 }
 
 func (ev *Evaluator) decodeVariable(filename string, f *hcl.File, block *hcl.Block) {
 	name := block.Labels[0]
-	v := &Variable{
-		Name:      name,
-		File:      filename,
-		DeclRange: block.DefRange,
-		Type:      cty.DynamicPseudoType,
-		Nullable:  true,
+	v, merge := ev.vars[name]
+	if !merge || !IsOverrideFile(filename) {
+		// OpenTofu merges a declaration in an override file into the
+		// primary one, attribute by attribute.
+		merge = false
+		v = &Variable{
+			Name:      name,
+			File:      filename,
+			DeclRange: block.DefRange,
+			Type:      cty.DynamicPseudoType,
+			Nullable:  true,
+		}
+		ev.vars[name] = v
 	}
-	ev.vars[name] = v
+	wasSensitive := v.Sensitive
+	defer func() {
+		// An override never makes a sensitive value displayable.
+		v.Sensitive = v.Sensitive || wasSensitive
+	}()
 
 	content, _, _ := block.Body.PartialContent(variableSchema)
 	if content == nil {
 		return
 	}
+	validations := 0
 	for _, b := range content.Blocks {
 		if b.Type == "validation" {
-			v.Validations++
+			validations++
 		}
+	}
+	if !merge || validations > 0 {
+		v.Validations = validations
 	}
 	if attr, ok := content.Attributes["description"]; ok {
 		if val, diags := attr.Expr.Value(nil); !diags.HasErrors() && val.Type() == cty.String && val.IsKnown() && !val.IsNull() {
@@ -490,6 +547,11 @@ func (ev *Evaluator) Eval(expr hcl.Expression, extra map[string]cty.Value) Resul
 	}
 
 	ctx := ev.evalContext(expr.Variables(), extra)
+	if n := forIterations(expr, ctx); n > maxForIterations {
+		// nested for expressions can build millions of values, which
+		// would stall the hover and take hundreds of megabytes
+		return Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: fmt.Sprintf("its for expressions run about %d iterations, too many to evaluate statically", n)}
+	}
 	val, diags := expr.Value(ctx)
 	if diags.HasErrors() {
 		// An unknown operand can surface as an error in some operations,
@@ -507,7 +569,81 @@ func (ev *Evaluator) Eval(expr hcl.Expression, extra map[string]cty.Value) Resul
 		r.Value = val
 		return r
 	}
-	return Result{Value: val, Kind: AfterApply, Reason: "an unknown value"}
+	// No reference or impure function explains the unknown part, so it
+	// comes from a function that could not compute it statically, such as
+	// a file function reading outside the module.
+	reason := "part of the value cannot be computed statically"
+	if callsFileFunction(expr) {
+		reason = "reads a file outside the module, or one that cannot be read"
+	}
+	return Result{Value: val, Kind: NotEvaluated, Reason: reason}
+}
+
+// maxForIterations caps the iterations of (nested) for expressions that
+// an evaluation may run.
+const maxForIterations = 50000
+
+// forIterations estimates how many iterations the for expressions of expr
+// run: for nested ones, the product of their collection lengths. A
+// collection that cannot be evaluated up front (it depends on an outer
+// iteration symbol) counts as one.
+func forIterations(expr hcl.Expression, ctx *hcl.EvalContext) int {
+	node := syntaxNode(expr)
+	if node == nil {
+		return 0
+	}
+	w := &forWalker{ctx: ctx, stack: []int{1}}
+	hclsyntax.Walk(node, w)
+	return w.max
+}
+
+type forWalker struct {
+	ctx   *hcl.EvalContext
+	stack []int
+	max   int
+}
+
+func (w *forWalker) Enter(node hclsyntax.Node) hcl.Diagnostics {
+	fe, ok := node.(*hclsyntax.ForExpr)
+	if !ok {
+		return nil
+	}
+	n := 1
+	if coll, diags := fe.CollExpr.Value(w.ctx); !diags.HasErrors() && coll.IsKnown() && !coll.IsNull() {
+		coll, _ = coll.Unmark()
+		if ty := coll.Type(); ty.IsCollectionType() || ty.IsObjectType() || ty.IsTupleType() {
+			n = coll.LengthInt()
+		}
+	}
+	total := w.stack[len(w.stack)-1] * n
+	if total > w.max {
+		w.max = total
+	}
+	w.stack = append(w.stack, total)
+	return nil
+}
+
+func (w *forWalker) Exit(node hclsyntax.Node) hcl.Diagnostics {
+	if _, ok := node.(*hclsyntax.ForExpr); ok {
+		w.stack = w.stack[:len(w.stack)-1]
+	}
+	return nil
+}
+
+// callsFileFunction reports whether expr calls a function that reads a
+// file.
+func callsFileFunction(expr hcl.Expression) bool {
+	found := false
+	hclsyntax.VisitAll(syntaxNode(expr), func(n hclsyntax.Node) hcl.Diagnostics {
+		if call, ok := n.(*hclsyntax.FunctionCallExpr); ok {
+			switch call.Name {
+			case "file", "fileexists", "templatefile":
+				found = true
+			}
+		}
+		return nil
+	})
+	return found
 }
 
 func (ev *Evaluator) evalContext(traversals []hcl.Traversal, extra map[string]cty.Value) *hcl.EvalContext {
@@ -517,6 +653,7 @@ func (ev *Evaluator) evalContext(traversals []hcl.Traversal, extra map[string]ct
 		"terraform": cty.ObjectVal(map[string]cty.Value{"workspace": cty.StringVal(ev.mod.Workspace)}),
 	}
 	locals := make(map[string]cty.Value)
+	resources := make(map[string][]hcl.Traversal)
 	for _, t := range traversals {
 		root := t.RootName()
 		switch root {
@@ -536,9 +673,16 @@ func (ev *Evaluator) evalContext(traversals []hcl.Traversal, extra map[string]ct
 		if root == "module" {
 			continue
 		}
-		// Resources, data sources, module outputs, self and any other
-		// symbol are only known during the plan.
+		if root != "data" && root != "self" && root != "ephemeral" {
+			resources[root] = append(resources[root], t)
+			continue
+		}
+		// Data sources, self and ephemeral resources are only known
+		// during the plan or apply.
 		vars[root] = cty.DynamicVal
+	}
+	for root, ts := range resources {
+		vars[root] = ev.resourceValue(root, ts)
 	}
 	vars["local"] = objectOrEmpty(locals)
 	vars["module"] = ev.moduleValue(traversals)
@@ -549,6 +693,71 @@ func (ev *Evaluator) evalContext(traversals []hcl.Traversal, extra map[string]ct
 		Variables: vars,
 		Functions: ev.funcs,
 	}
+}
+
+// resourceValue builds the value of the resources of one type that the
+// traversals refer to. An argument the configuration sets is known
+// during the plan, with the value it is set to, when the resource has no
+// count or for_each and the provider schema says the attribute is not
+// computed. Everything else is unknown.
+func (ev *Evaluator) resourceValue(typeName string, traversals []hcl.Traversal) cty.Value {
+	names := make(map[string]map[string]cty.Value)
+	for _, t := range traversals {
+		if len(t) < 3 {
+			return cty.DynamicVal
+		}
+		name, ok1 := t[1].(hcl.TraverseAttr)
+		attr, ok2 := t[2].(hcl.TraverseAttr)
+		if !ok1 || !ok2 {
+			// the whole object, or an instance of a counted resource
+			return cty.DynamicVal
+		}
+		if names[name.Name] == nil {
+			names[name.Name] = make(map[string]cty.Value)
+		}
+		names[name.Name][attr.Name] = ev.configuredAttribute(typeName, name.Name, attr.Name)
+	}
+	objs := make(map[string]cty.Value, len(names))
+	for name, attrs := range names {
+		objs[name] = cty.ObjectVal(attrs)
+	}
+	return cty.ObjectVal(objs)
+}
+
+// configuredAttribute evaluates the argument attr that the resource
+// typeName.name sets in its configuration, or returns an unknown value.
+func (ev *Evaluator) configuredAttribute(typeName, name, attr string) cty.Value {
+	if ev.host == nil || ev.host.Attribute == nil {
+		return cty.DynamicVal
+	}
+	info, ok := ev.host.Attribute("resource", typeName, attr)
+	if !ok || info.Computed {
+		// a provider may plan another value for an optional and
+		// computed argument (legacy providers normalize some)
+		return cty.DynamicVal
+	}
+	block := ev.findBlock("resource", typeName, name)
+	if block == nil || block.Body.Attributes["count"] != nil || block.Body.Attributes["for_each"] != nil {
+		return cty.DynamicVal
+	}
+	a, ok := block.Body.Attributes[attr]
+	if !ok {
+		return cty.DynamicVal
+	}
+	key := "resource " + typeName + "." + name + "." + attr
+	if ev.evaluating[key] {
+		return cty.DynamicVal
+	}
+	ev.evaluating[key] = true
+	r := ev.Eval(a.Expr, nil)
+	delete(ev.evaluating, key)
+	if !r.IsKnown() {
+		return cty.DynamicVal
+	}
+	if info.Sensitive {
+		return r.Value.Mark(SensitiveMark)
+	}
+	return r.Value
 }
 
 // moduleValue builds the module object for the module calls that the
@@ -569,6 +778,9 @@ func (ev *Evaluator) moduleValue(traversals []hcl.Traversal) cty.Value {
 		outs, ok := ev.evalModuleOutputs(name)
 		if !ok {
 			calls[name] = cty.DynamicVal
+			if v, ok := ev.evalModuleInstances(name); ok {
+				calls[name] = v
+			}
 			continue
 		}
 		vals := make(map[string]cty.Value, len(outs))
@@ -593,7 +805,7 @@ func (ev *Evaluator) evalModuleOutputs(name string) (map[string]Result, bool) {
 		return outs, outs != nil
 	}
 	ev.moduleOutputs[name] = nil
-	if ev.host == nil {
+	if ev.host == nil || ev.depth >= maxModuleDepth {
 		return nil, false
 	}
 	block := ev.findModuleCall(name)
@@ -618,6 +830,69 @@ func (ev *Evaluator) evalModuleOutputs(name string) (map[string]Result, bool) {
 	}
 	ev.moduleOutputs[name] = outs
 	return outs, true
+}
+
+// maxModuleInstances caps the instances of a module call whose outputs
+// are evaluated.
+const maxModuleInstances = 32
+
+// evalModuleInstances evaluates the outputs of every instance of a module
+// call with for_each or count: an object by instance key for for_each, a
+// tuple for count. Unknown outputs are unknown values in it.
+func (ev *Evaluator) evalModuleInstances(name string) (cty.Value, bool) {
+	if v, ok := ev.moduleInstances[name]; ok {
+		return v, v != cty.NilVal
+	}
+	ev.moduleInstances[name] = cty.NilVal
+	if ev.host == nil || ev.depth >= maxModuleDepth {
+		return cty.NilVal, false
+	}
+	block := ev.findModuleCall(name)
+	if block == nil {
+		return cty.NilVal, false
+	}
+	meta, r, insts, ok := ev.Instances(block)
+	if !ok || !r.IsKnown() || r.IsSensitive() || len(insts) > maxModuleInstances {
+		return cty.NilVal, false
+	}
+	mc, ok := ev.resolveModuleCall(block, *ev.host)
+	if !ok {
+		return cty.NilVal, false
+	}
+	outputs := mc.child.outputs()
+	byKey := make(map[string]cty.Value, len(insts))
+	list := make([]cty.Value, 0, len(insts))
+	for _, inst := range insts {
+		child := ev.childEvaluatorFor(mc, inst.Each)
+		vals := make(map[string]cty.Value, len(outputs))
+		for outName, o := range outputs {
+			val := cty.DynamicVal
+			if o.expr != nil {
+				if r := child.Eval(o.expr, nil); r.IsKnown() {
+					val = r.Value
+					if o.sensitive {
+						val = val.Mark(SensitiveMark)
+					}
+				}
+			}
+			vals[outName] = val
+		}
+		obj := objectOrEmpty(vals)
+		if meta == "count" {
+			list = append(list, obj)
+		} else if inst.Key.Type() == cty.String {
+			byKey[inst.Key.AsString()] = obj
+		}
+	}
+	v := objectOrEmpty(byKey)
+	if meta == "count" {
+		v = cty.EmptyTupleVal
+		if len(list) > 0 {
+			v = cty.TupleVal(list)
+		}
+	}
+	ev.moduleInstances[name] = v
+	return v, true
 }
 
 func (ev *Evaluator) pathValue() cty.Value {
@@ -671,10 +946,25 @@ func (ev *Evaluator) unknownCause(expr hcl.Expression, ctx *hcl.EvalContext) (Re
 			call, _ := attrStep(t, 1)
 			out, _ := attrStep(t, 2)
 			if r, ok := ev.moduleOutputs[call][out]; ok && !r.IsKnown() {
-				return Result{Kind: r.Kind, Reason: TraversalString(t)}, true
+				if r.Kind == NotEvaluated {
+					// the child's own reason, such as an unsupported function
+					return Result{Kind: NotEvaluated, Reason: r.Reason}, true
+				}
+				return Result{Kind: r.Kind, Reason: TraversalString(t), Detail: r.Detail}, true
 			}
 			if diags.HasErrors() {
 				continue
+			}
+			if ev.moduleOutputs[call] == nil {
+				// The call's outputs were not evaluated: it has too many
+				// or unknown instances, or its module could not be loaded.
+				reason := "module." + call + " is not evaluated statically"
+				if v := ev.moduleInstances[call]; v != cty.NilVal {
+					reason = "`" + TraversalString(t) + "` is not known statically"
+				} else if block := ev.findModuleCall(call); block != nil && (block.Body.Attributes["for_each"] != nil || block.Body.Attributes["count"] != nil) {
+					reason = "module." + call + " has several instances (for_each or count), which are not evaluated statically"
+				}
+				return Result{Kind: NotEvaluated, Reason: reason}, true
 			}
 			return Result{Kind: AfterApply, Reason: TraversalString(t)}, true
 		case "each", "count":
@@ -687,15 +977,21 @@ func (ev *Evaluator) unknownCause(expr hcl.Expression, ctx *hcl.EvalContext) (Re
 			continue
 		}
 		if t.RootName() == "data" {
-			return Result{Kind: AtPlan, Reason: TraversalString(t)}, true
+			return ev.dataCause(t), true
 		}
 		return Result{Kind: AfterApply, Reason: TraversalString(t)}, true
 	}
 
-	var fn string
+	var fn, atPlan string
 	hclsyntax.VisitAll(syntaxNode(expr), func(n hclsyntax.Node) hcl.Diagnostics {
-		if call, ok := n.(*hclsyntax.FunctionCallExpr); ok && fn == "" {
-			if earlydecoder.ImpureFunctions[call.Name] {
+		if call, ok := n.(*hclsyntax.FunctionCallExpr); ok && earlydecoder.ImpureFunctions[call.Name] {
+			switch {
+			case call.Name == "plantimestamp":
+				// plantimestamp is fixed when the plan is made.
+				if atPlan == "" {
+					atPlan = call.Name
+				}
+			case fn == "":
 				fn = call.Name
 			}
 		}
@@ -704,7 +1000,91 @@ func (ev *Evaluator) unknownCause(expr hcl.Expression, ctx *hcl.EvalContext) (Re
 	if fn != "" {
 		return Result{Kind: AfterApply, Reason: fn + "()"}, true
 	}
+	if atPlan != "" {
+		return Result{Kind: AtPlan, Reason: atPlan + "()"}, true
+	}
 	return Result{}, false
+}
+
+// dataCause says when the data source that t refers to is read: during
+// the plan, or during apply when its depends_on names a managed resource
+// or module, or when one of its arguments is only known after apply.
+func (ev *Evaluator) dataCause(t hcl.Traversal) Result {
+	ref := TraversalString(t)
+	typeName, ok1 := attrStep(t, 1)
+	name, ok2 := attrStep(t, 2)
+	if !ok1 || !ok2 {
+		return Result{Kind: AtPlan, Reason: ref}
+	}
+	r := ev.DataReadTiming(typeName, name)
+	switch r.Kind {
+	case AtPlan:
+		return Result{Kind: AtPlan, Reason: ref}
+	case AfterApply:
+		return Result{Kind: AfterApply, Reason: ref, Detail: r.Detail}
+	}
+	return r
+}
+
+// DataReadTiming says when OpenTofu reads the data source with the given
+// type and name. Kind is AtPlan when it is read during the plan and
+// AfterApply, with Detail saying why, when it is read during apply. Any
+// other kind is the result of an argument that is not known statically.
+func (ev *Evaluator) DataReadTiming(typeName, name string) Result {
+	addr := "data." + typeName + "." + name
+	block := ev.findBlock("data", typeName, name)
+	if block == nil || ev.readingData[addr] {
+		return Result{Kind: AtPlan}
+	}
+	ev.readingData[addr] = true
+	defer delete(ev.readingData, addr)
+
+	if attr, ok := block.Body.Attributes["depends_on"]; ok {
+		for _, dep := range attr.Expr.Variables() {
+			switch dep.RootName() {
+			case "data":
+				depType, _ := attrStep(dep, 1)
+				depName, _ := attrStep(dep, 2)
+				if r := ev.DataReadTiming(depType, depName); r.Kind == AfterApply {
+					return Result{Kind: AfterApply, Detail: fmt.Sprintf("`%s` is read during apply: its `depends_on` names `%s`, which is read during apply", addr, TraversalString(dep))}
+				}
+			case "var", "local", "path", "terraform", "each", "count", "self":
+			default:
+				return Result{Kind: AfterApply, Detail: fmt.Sprintf("`%s` is read during apply whenever `%s` in its `depends_on` has changes, which includes the first apply", addr, TraversalString(dep))}
+			}
+		}
+	}
+
+	var cause *Result
+	var visit func(body *hclsyntax.Body)
+	visit = func(body *hclsyntax.Body) {
+		for _, attrName := range mapKeys(body.Attributes) {
+			switch attrName {
+			case "count", "for_each", "depends_on", "provider":
+				continue
+			}
+			if cause != nil {
+				return
+			}
+			r := ev.Eval(body.Attributes[attrName].Expr, nil)
+			if !r.IsKnown() && r.Kind != AtPlan {
+				cause = &r
+			}
+		}
+		for _, b := range body.Blocks {
+			if b.Type != "lifecycle" && cause == nil {
+				visit(b.Body)
+			}
+		}
+	}
+	visit(block.Body)
+	if cause == nil {
+		return Result{Kind: AtPlan}
+	}
+	if cause.Kind == AfterApply {
+		return Result{Kind: AfterApply, Detail: fmt.Sprintf("`%s` is read during apply: its arguments depend on `%s`", addr, cause.Reason)}
+	}
+	return *cause
 }
 
 // unsupportedFunction returns the name of the first function called in

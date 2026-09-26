@@ -6,9 +6,11 @@
 package refactor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -18,7 +20,9 @@ import (
 	"github.com/hashicorp/hcl-lang/reference"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	hcljson "github.com/hashicorp/hcl/v2/json"
 	tfmod "github.com/opentofu/opentofu-schema/module"
+	"github.com/zclconf/go-cty/cty"
 )
 
 type SymbolKind string
@@ -83,6 +87,12 @@ type Env struct {
 	ReadFile func(path string) ([]byte, error)
 	// ModuleCalls returns the module calls declared in a module directory.
 	ModuleCalls func(modPath string) (map[string]tfmod.DeclaredModuleCall, error)
+	// ReadDir lists a directory, for var files that are not indexed. It
+	// may be nil.
+	ReadDir func(dir string) ([]fs.DirEntry, error)
+	// InWorkspace reports whether a directory is inside one of the
+	// workspace folders. It may be nil, and then every directory is.
+	InWorkspace func(dir string) bool
 }
 
 // Symbol is a renamable declaration.
@@ -126,6 +136,8 @@ type fileCache struct {
 	env   Env
 	src   map[string][]byte
 	files map[string]*hcl.File
+	// base is the module directory that messages name files relative to.
+	base string
 }
 
 func newFileCache(env Env) *fileCache {
@@ -144,6 +156,18 @@ func (c *fileCache) source(path string) ([]byte, error) {
 	return src, nil
 }
 
+// displayPath names a file for messages, relative to the module the
+// request started in, so that main.tf of a child module is not mistaken
+// for the open main.tf.
+func (c *fileCache) displayPath(path string) string {
+	if c.base != "" {
+		if rel, err := filepath.Rel(c.base, path); err == nil {
+			return rel
+		}
+	}
+	return path
+}
+
 func (c *fileCache) body(path string) (*hclsyntax.Body, []byte, error) {
 	src, err := c.source(path)
 	if err != nil {
@@ -157,7 +181,7 @@ func (c *fileCache) body(path string) (*hclsyntax.Body, []byte, error) {
 		var diags hcl.Diagnostics
 		f, diags = hclsyntax.ParseConfig(src, filepath.Base(path), hcl.InitialPos)
 		if diags.HasErrors() {
-			return nil, nil, fmt.Errorf("%s has syntax errors; fix them before renaming", filepath.Base(path))
+			return nil, nil, fmt.Errorf("%s has syntax errors; fix them before renaming", c.displayPath(path))
 		}
 		c.files[path] = f
 	}
@@ -168,9 +192,31 @@ func (c *fileCache) body(path string) (*hclsyntax.Body, []byte, error) {
 	return body, src, nil
 }
 
-// FindSymbol returns the renamable symbol at pos, or ErrNotRenamable.
+// FindSymbol returns the renamable symbol at pos, or ErrNotRenamable. It
+// refuses symbols declared in a module the user does not edit: one
+// installed under .terraform (from a registry or git), or one outside the
+// workspace, whose other callers cannot be seen.
 func FindSymbol(ctx context.Context, env Env, path lang.Path, file string, pos hcl.Pos) (*Symbol, error) {
-	return findSymbol(ctx, env, newFileCache(env), path, file, pos)
+	fc := newFileCache(env)
+	fc.base = path.Path
+	sym, err := findSymbol(ctx, env, fc, path, file, pos)
+	if err != nil {
+		return nil, err
+	}
+	if isInstalledModule(sym.Path.Path) {
+		return nil, fmt.Errorf("%s is declared in a module installed by tofu init (%s); rename it in the module's source instead", sym.Addr.String(), sym.Path.Path)
+	}
+	if env.InWorkspace != nil && !env.InWorkspace(sym.Path.Path) {
+		return nil, fmt.Errorf("%s is declared in %s, outside the workspace, where other callers of the module cannot be seen; open that folder to rename it", sym.Addr.String(), sym.Path.Path)
+	}
+	return sym, nil
+}
+
+// isInstalledModule reports whether a module directory was installed by
+// tofu init under .terraform, for example from a registry or git.
+func isInstalledModule(dir string) bool {
+	sep := string(filepath.Separator)
+	return strings.Contains(filepath.Clean(dir)+sep, sep+".terraform"+sep)
 }
 
 func findSymbol(ctx context.Context, env Env, fc *fileCache, path lang.Path, file string, pos hcl.Pos) (*Symbol, error) {
@@ -200,7 +246,11 @@ func findSymbol(ctx context.Context, env Env, fc *fileCache, path lang.Path, fil
 		return nil, ErrNotRenamable
 	}
 
-	for _, target := range pathCtx.ReferenceTargets {
+	targets := pathCtx.ReferenceTargets
+	if target, ok := checkScopedDataTarget(fc, path.Path, pathCtx, nil, &hcl.Range{Filename: file, Start: pos, End: pos}); ok {
+		targets = append(targets[:len(targets):len(targets)], target)
+	}
+	for _, target := range targets {
 		kind, ok := kindOfTarget(target)
 		if !ok || target.RangePtr == nil || target.RangePtr.Filename != file {
 			continue
@@ -264,6 +314,46 @@ func kindOfTarget(target reference.Target) (SymbolKind, bool) {
 		return KindResource, true
 	}
 	return "", false
+}
+
+// checkScopedDataTarget finds a data source declared inside a check block,
+// which the schema declares no reference target for: by its address, or
+// (with addr nil) by a label range holding the position at.
+func checkScopedDataTarget(fc *fileCache, modPath string, pathCtx *decoder.PathContext, addr lang.Address, at *hcl.Range) (reference.Target, bool) {
+	for _, name := range sortedHCLFiles(pathCtx) {
+		if at != nil && name != at.Filename {
+			continue
+		}
+		body, _, err := fc.body(filepath.Join(modPath, name))
+		if err != nil {
+			continue
+		}
+		for _, check := range body.Blocks {
+			if check.Type != "check" {
+				continue
+			}
+			for _, block := range check.Body.Blocks {
+				if block.Type != "data" || len(block.Labels) != 2 {
+					continue
+				}
+				dataAddr := lang.Address{
+					lang.RootStep{Name: "data"},
+					lang.AttrStep{Name: block.Labels[0]},
+					lang.AttrStep{Name: block.Labels[1]},
+				}
+				if addr != nil && !dataAddr.Equals(addr) {
+					continue
+				}
+				if at != nil && !block.LabelRanges[1].ContainsPos(at.Start) {
+					continue
+				}
+				rng := block.Range()
+				rng.Filename = name
+				return reference.Target{Addr: dataAddr, ScopeId: KindData.scope(), RangePtr: &rng}, true
+			}
+		}
+	}
+	return reference.Target{}, false
 }
 
 // declaredTarget finds the declaration of addr with the kind's scope.
@@ -359,6 +449,9 @@ func symbolFromOrigin(env Env, fc *fileCache, path lang.Path, pathCtx *decoder.P
 		}
 		symAddr := addr.FirstSteps(uint(nameIdx + 1))
 		target, ok := declaredTarget(pathCtx, kind, symAddr)
+		if !ok && kind == KindData {
+			target, ok = checkScopedDataTarget(fc, path.Path, pathCtx, symAddr, nil)
+		}
 		if !ok {
 			return nil, nil
 		}
@@ -444,7 +537,16 @@ func symbolFromTarget(fc *fileCache, path lang.Path, kind SymbolKind, target ref
 	}
 
 	start := target.RangePtr.Start
-	for _, block := range body.Blocks {
+	blocks := body.Blocks
+	if kind == KindData {
+		// data sources scoped to a check block
+		for _, block := range body.Blocks {
+			if block.Type == "check" {
+				blocks = append(blocks[:len(blocks):len(blocks)], block.Body.Blocks...)
+			}
+		}
+	}
+	for _, block := range blocks {
 		if kind == KindLocal {
 			if block.Type != "locals" {
 				continue
@@ -570,11 +672,20 @@ func Rename(ctx context.Context, env Env, sym *Symbol, newName string, opts Opti
 	} else {
 		newAddr[nameIdx] = lang.AttrStep{Name: newName}
 	}
-	if _, exists := declaredTarget(pathCtx, sym.Kind, newAddr); exists {
+	fc := newFileCache(env)
+	fc.base = sym.Path.Path
+	_, exists := declaredTarget(pathCtx, sym.Kind, newAddr)
+	if !exists && sym.Kind == KindData {
+		_, exists = checkScopedDataTarget(fc, sym.Path.Path, pathCtx, newAddr, nil)
+	}
+	if exists {
 		return nil, fmt.Errorf("%s already exists", newAddr.String())
 	}
-
-	fc := newFileCache(env)
+	if sym.Kind.movable() {
+		if err := historyCollision(fc, sym.Path.Path, pathCtx, sym.Addr, newAddr); err != nil {
+			return nil, err
+		}
+	}
 	edits := newEditSet()
 	declFile := filepath.Join(sym.Path.Path, sym.target.RangePtr.Filename)
 	edits.add(declFile, sym.NameRange, newName)
@@ -598,6 +709,33 @@ func Rename(ctx context.Context, env Env, sym *Symbol, newName string, opts Opti
 		})
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// the same declaration in override files, which OpenTofu merges into
+	// this one and which must keep its address
+	if err := renameOverrides(fc, sym, declFile, pathCtx, newName, edits); err != nil {
+		return nil, err
+	}
+
+	// test files: run blocks refer to the module's objects, and variables
+	// blocks set its variables
+	for _, file := range moduleTestFiles(env, sym.Path.Path) {
+		body, _, err := fc.body(file)
+		if err != nil {
+			return nil, err
+		}
+		prefix := addrNames(sym.Addr)
+		_ = walkBodyTraversals(body, "", false, func(tr hcl.Traversal, _ bool) error {
+			if rng, ok := stepRangeIfPrefix(tr, prefix, nameIdx); ok {
+				edits.add(file, rng, newName)
+			}
+			return nil
+		})
+		if sym.Kind == KindVariable {
+			for _, rng := range testVariableKeys(body, sym.Name) {
+				edits.add(file, rng, newName)
+			}
 		}
 	}
 
@@ -626,6 +764,17 @@ func Rename(ctx context.Context, env Env, sym *Symbol, newName string, opts Opti
 			}
 			edits.add(file, rng, newName)
 		}
+		// var files in subdirectories (such as envs/prod.tfvars) are not
+		// indexed, but -var-file uses them with this module
+		for _, file := range subdirVarFiles(env, sym.Path.Path) {
+			src, err := fc.source(file)
+			if err != nil {
+				continue
+			}
+			for _, rng := range varFileKeyRanges(file, src, sym.Name) {
+				edits.add(file, rng, newName)
+			}
+		}
 	}
 
 	// module.<call>.<output> in modules calling this one
@@ -643,9 +792,11 @@ func Rename(ctx context.Context, env Env, sym *Symbol, newName string, opts Opti
 				continue
 			}
 			for call := range calls {
-				prefix := []string{"module", call, sym.Name}
+				if file, rng, ok := forExprOverModule(fc, p.Path, parentCtx, call); ok {
+					return nil, fmt.Errorf("module.%s is iterated by a for expression (%s:%d), whose uses of %s cannot be renamed safely; rename them by hand", call, fc.displayPath(file), rng.Start.Line, sym.Name)
+				}
 				err := walkModuleTraversals(fc, p.Path, parentCtx, func(file string, tr hcl.Traversal, _ bool) error {
-					if rng, ok := stepRangeIfPrefix(tr, prefix, 2); ok {
+					if rng, ok := moduleOutputStepRange(tr, call, sym.Name); ok {
 						edits.add(file, rng, newName)
 					}
 					return nil
@@ -666,6 +817,295 @@ func Rename(ctx context.Context, env Env, sym *Symbol, newName string, opts Opti
 	}
 
 	return edits.list(), nil
+}
+
+// moduleOutputStepRange returns the range of the output name (without the
+// dot) in module.<call>.<output>, module.<call>[key].<output> or
+// module.<call>[*].<output>.
+func moduleOutputStepRange(tr hcl.Traversal, call, output string) (hcl.Range, bool) {
+	if len(tr) < 3 {
+		return hcl.Range{}, false
+	}
+	if root, ok := tr[0].(hcl.TraverseRoot); !ok || root.Name != "module" {
+		return hcl.Range{}, false
+	}
+	if c, ok := tr[1].(hcl.TraverseAttr); !ok || c.Name != call {
+		return hcl.Range{}, false
+	}
+	i := 2
+	switch tr[i].(type) {
+	case hcl.TraverseIndex, hcl.TraverseSplat:
+		i++
+	}
+	if i >= len(tr) {
+		return hcl.Range{}, false
+	}
+	out, ok := tr[i].(hcl.TraverseAttr)
+	if !ok || out.Name != output {
+		return hcl.Range{}, false
+	}
+	rng := out.SrcRange
+	if rng.End.Byte-rng.Start.Byte == len(out.Name)+1 {
+		rng.Start = shiftPos(rng.Start, 1)
+	}
+	return rng, true
+}
+
+// forExprOverModule finds a for expression in the module at modPath whose
+// collection is module.<call> itself, so that the output is reached
+// through the iteration symbol, which rename cannot follow.
+func forExprOverModule(fc *fileCache, modPath string, pathCtx *decoder.PathContext, call string) (string, hcl.Range, bool) {
+	for _, name := range sortedHCLFiles(pathCtx) {
+		file := filepath.Join(modPath, name)
+		body, _, err := fc.body(file)
+		if err != nil {
+			continue
+		}
+		var found *hcl.Range
+		hclsyntax.VisitAll(body, func(node hclsyntax.Node) hcl.Diagnostics {
+			fe, ok := node.(*hclsyntax.ForExpr)
+			if !ok || found != nil {
+				return nil
+			}
+			if coll, ok := fe.CollExpr.(*hclsyntax.ScopeTraversalExpr); ok && len(coll.Traversal) == 2 &&
+				coll.Traversal.RootName() == "module" {
+				if c, ok := coll.Traversal[1].(hcl.TraverseAttr); ok && c.Name == call {
+					rng := fe.SrcRange
+					found = &rng
+				}
+			}
+			return nil
+		})
+		if found != nil {
+			return file, *found, true
+		}
+	}
+	return "", hcl.Range{}, false
+}
+
+// isOverrideFile reports whether a configuration file is an override
+// file (override.tf, *_override.tf and their .tofu forms).
+func isOverrideFile(name string) bool {
+	for _, ext := range []string{".tf", ".tofu"} {
+		if strings.HasSuffix(name, ext) {
+			base := strings.TrimSuffix(filepath.Base(name), ext)
+			return base == "override" || strings.HasSuffix(base, "_override")
+		}
+	}
+	return false
+}
+
+// renameOverrides renames the labels (or, for a local, the attribute
+// name) of the declarations with the symbol's address in the module's
+// override files, which OpenTofu merges into the primary declaration.
+func renameOverrides(fc *fileCache, sym *Symbol, declFile string, pathCtx *decoder.PathContext, newName string, edits *editSet) error {
+	for _, name := range sortedHCLFiles(pathCtx) {
+		file := filepath.Join(sym.Path.Path, name)
+		if !isOverrideFile(name) || file == declFile {
+			continue
+		}
+		body, src, err := fc.body(file)
+		if err != nil {
+			return err
+		}
+		for _, block := range body.Blocks {
+			if sym.Kind == KindLocal {
+				if block.Type != "locals" {
+					continue
+				}
+				if attr, ok := block.Body.Attributes[sym.Name]; ok {
+					edits.add(file, attr.NameRange, newName)
+				}
+				continue
+			}
+			if block.Type != string(sym.Kind) {
+				continue
+			}
+			i := sym.Kind.labelIndex()
+			if len(block.Labels) != i+1 || block.Labels[i] != sym.Name {
+				continue
+			}
+			if sym.Kind == KindResource || sym.Kind == KindData {
+				if block.Labels[0] != stepName(sym.Addr[sym.Kind.nameIndex()-1]) {
+					continue
+				}
+			}
+			if rng, ok := unquotedLabelRange(src, block.LabelRanges[i], sym.Name); ok {
+				edits.add(file, rng, newName)
+			}
+		}
+	}
+	return nil
+}
+
+// moduleTestFiles returns the test files (*.tftest.hcl, *.tofutest.hcl)
+// of a module: next to it and in its tests directory.
+func moduleTestFiles(env Env, modPath string) []string {
+	if env.ReadDir == nil {
+		return nil
+	}
+	var files []string
+	for _, dir := range []string{modPath, filepath.Join(modPath, "tests")} {
+		entries, err := env.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if !e.IsDir() && (strings.HasSuffix(name, ".tftest.hcl") || strings.HasSuffix(name, ".tofutest.hcl")) {
+				files = append(files, filepath.Join(dir, name))
+			}
+		}
+	}
+	sort.Strings(files)
+	return files
+}
+
+// testVariableKeys returns the ranges of the keys called name in the
+// variables blocks of a test file, at the top level and in run blocks.
+func testVariableKeys(body *hclsyntax.Body, name string) []hcl.Range {
+	var ranges []hcl.Range
+	for _, block := range body.Blocks {
+		switch block.Type {
+		case "variables":
+			if attr, ok := block.Body.Attributes[name]; ok {
+				ranges = append(ranges, attr.NameRange)
+			}
+		case "run":
+			ranges = append(ranges, testVariableKeys(block.Body, name)...)
+		}
+	}
+	return ranges
+}
+
+// maxVarFileDepth is how many directory levels below a module rename
+// looks for var files.
+const maxVarFileDepth = 3
+
+// subdirVarFiles returns the var files (*.tfvars, *.tfvars.json) in the
+// subdirectories of a module, skipping hidden directories and
+// subdirectories that hold their own configuration (other modules). The
+// language server indexes only the var files next to the module.
+func subdirVarFiles(env Env, modPath string) []string {
+	if env.ReadDir == nil {
+		return nil
+	}
+	var files []string
+	var walk func(dir string, depth int, top bool)
+	walk = func(dir string, depth int, top bool) {
+		entries, err := env.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		var found []string
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || top {
+				continue
+			}
+			switch {
+			case strings.HasSuffix(name, ".tf") || strings.HasSuffix(name, ".tofu"):
+				// another module: its var files are its own
+				return
+			case strings.HasSuffix(name, ".tfvars") || strings.HasSuffix(name, ".tfvars.json"):
+				found = append(found, filepath.Join(dir, name))
+			}
+		}
+		files = append(files, found...)
+		if depth >= maxVarFileDepth {
+			return
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if !e.IsDir() || strings.HasPrefix(name, ".") {
+				continue
+			}
+			walk(filepath.Join(dir, name), depth+1, false)
+		}
+	}
+	walk(modPath, 0, true)
+	sort.Strings(files)
+	return files
+}
+
+// varFileKeyRanges returns the range of every top-level key called name
+// in a var file, without quotes.
+func varFileKeyRanges(file string, src []byte, name string) []hcl.Range {
+	var f *hcl.File
+	var diags hcl.Diagnostics
+	if strings.HasSuffix(file, ".json") {
+		f, diags = hcljson.Parse(src, file)
+	} else {
+		f, diags = hclsyntax.ParseConfig(src, file, hcl.InitialPos)
+	}
+	if diags.HasErrors() || f == nil {
+		return nil
+	}
+	attrs, _ := f.Body.JustAttributes()
+	attr, ok := attrs[name]
+	if !ok {
+		return nil
+	}
+	rng, ok := unquotedLabelRange(src, attr.NameRange, name)
+	if !ok {
+		return nil
+	}
+	return []hcl.Range{rng}
+}
+
+// historyCollision refuses a new address that a moved or removed block of
+// the module already names as its from address: OpenTofu would treat the
+// renamed object as moved away or removed, and a moved block back to the
+// old name would make a cycle. Whether such a block has been applied is in
+// the state, which rename cannot see, so the user decides.
+func historyCollision(fc *fileCache, modPath string, pathCtx *decoder.PathContext, oldAddr, newAddr lang.Address) error {
+	for _, name := range sortedHCLFiles(pathCtx) {
+		file := filepath.Join(modPath, name)
+		body, _, err := fc.body(file)
+		if err != nil {
+			return err
+		}
+		for _, block := range body.Blocks {
+			if block.Type != "moved" && block.Type != "removed" {
+				continue
+			}
+			from, ok := block.Body.Attributes["from"]
+			if !ok {
+				continue
+			}
+			tr, diags := hcl.AbsTraversalForExpr(from.Expr)
+			if diags.HasErrors() || traversalWithoutKeys(tr) != newAddr.String() {
+				continue
+			}
+			where := fmt.Sprintf("%s:%d", fc.displayPath(file), block.DefRange().Start.Line)
+			if block.Type == "removed" {
+				return fmt.Errorf("%s is the from address of a removed block (%s), so OpenTofu would remove the renamed object; pick another name", newAddr.String(), where)
+			}
+			if to, ok := block.Body.Attributes["to"]; ok {
+				if toTr, diags := hcl.AbsTraversalForExpr(to.Expr); !diags.HasErrors() && traversalWithoutKeys(toTr) == oldAddr.String() {
+					return fmt.Errorf("the moved block at %s moves %s to %s, so renaming back would make a cycle; delete that moved block first if it has not been applied, or pick another name", where, newAddr.String(), oldAddr.String())
+				}
+			}
+			return fmt.Errorf("%s is the from address of a moved block (%s), so OpenTofu would move the renamed object; pick another name", newAddr.String(), where)
+		}
+	}
+	return nil
+}
+
+// traversalWithoutKeys renders the names of a traversal, leaving out
+// instance keys: module.app[0].terraform_data.web is
+// module.app.terraform_data.web.
+func traversalWithoutKeys(tr hcl.Traversal) string {
+	names := make([]string, 0, len(tr))
+	for _, step := range tr {
+		switch s := step.(type) {
+		case hcl.TraverseRoot:
+			names = append(names, s.Name)
+		case hcl.TraverseAttr:
+			names = append(names, s.Name)
+		}
+	}
+	return strings.Join(names, ".")
 }
 
 // addrNames returns the step names of a root/attribute address.
@@ -714,16 +1154,7 @@ func stepRangeIfPrefix(tr hcl.Traversal, prefix []string, i int) (hcl.Range, boo
 // providers meta-arguments (provider "local" would otherwise look like
 // local.* values).
 func walkModuleTraversals(fc *fileCache, modPath string, pathCtx *decoder.PathContext, fn func(file string, tr hcl.Traversal, inMoved bool) error) error {
-	filenames := make([]string, 0, len(pathCtx.Files))
-	for name := range pathCtx.Files {
-		if strings.HasSuffix(name, ".json") {
-			continue
-		}
-		filenames = append(filenames, name)
-	}
-	sort.Strings(filenames)
-
-	for _, name := range filenames {
+	for _, name := range sortedHCLFiles(pathCtx) {
 		file := filepath.Join(modPath, name)
 		body, _, err := fc.body(file)
 		if err != nil {
@@ -738,18 +1169,42 @@ func walkModuleTraversals(fc *fileCache, modPath string, pathCtx *decoder.PathCo
 	return nil
 }
 
+// sortedHCLFiles returns the module's native syntax files in lexical order.
+func sortedHCLFiles(pathCtx *decoder.PathContext) []string {
+	filenames := make([]string, 0, len(pathCtx.Files))
+	for name := range pathCtx.Files {
+		if strings.HasSuffix(name, ".json") {
+			continue
+		}
+		filenames = append(filenames, name)
+	}
+	sort.Strings(filenames)
+	return filenames
+}
+
 func walkBodyTraversals(body *hclsyntax.Body, blockType string, inMoved bool, fn func(tr hcl.Traversal, inMoved bool) error) error {
 	for name, attr := range body.Attributes {
+		var providerAddrs map[hcl.Range]bool
 		if isProviderMetaArgument(blockType, name) {
-			continue
+			providerAddrs = providerAddressRanges(attr.Expr, map[hcl.Range]bool{})
 		}
 		var walkErr error
 		hclsyntax.VisitAll(attr.Expr, func(node hclsyntax.Node) hcl.Diagnostics {
 			if walkErr != nil {
 				return nil
 			}
+			if providerAddrs != nil {
+				// only the instance keys of provider references, such as
+				// local.k in random.by_key[local.k], are values
+				if expr, ok := node.(*hclsyntax.ScopeTraversalExpr); ok && !providerAddrs[expr.SrcRange] {
+					walkErr = fn(expr.Traversal, inMoved)
+				}
+				return nil
+			}
 			if expr, ok := node.(*hclsyntax.ScopeTraversalExpr); ok {
 				walkErr = fn(expr.Traversal, inMoved)
+			} else if tr, ok := joinedTraversal(node); ok {
+				walkErr = fn(tr, inMoved)
 			}
 			return nil
 		})
@@ -763,6 +1218,63 @@ func walkBodyTraversals(body *hclsyntax.Body, blockType string, inMoved bool, fn
 		}
 	}
 	return nil
+}
+
+// joinedTraversal rebuilds the whole traversal of a splat such as
+// module.x[*].out, or of an index with a dynamic key such as
+// module.x[local.k].out, which the syntax splits into a source
+// expression and a relative traversal. The key of a dynamic index is
+// left unknown.
+func joinedTraversal(node hclsyntax.Node) (hcl.Traversal, bool) {
+	switch e := node.(type) {
+	case *hclsyntax.SplatExpr:
+		src, ok := e.Source.(*hclsyntax.ScopeTraversalExpr)
+		if !ok {
+			return nil, false
+		}
+		each, ok := e.Each.(*hclsyntax.RelativeTraversalExpr)
+		if !ok {
+			return nil, false
+		}
+		if _, ok := each.Source.(*hclsyntax.AnonSymbolExpr); !ok {
+			return nil, false
+		}
+		tr := append(hcl.Traversal{}, src.Traversal...)
+		tr = append(tr, hcl.TraverseSplat{SrcRange: e.MarkerRange})
+		return append(tr, each.Traversal...), true
+	case *hclsyntax.RelativeTraversalExpr:
+		idx, ok := e.Source.(*hclsyntax.IndexExpr)
+		if !ok {
+			return nil, false
+		}
+		coll, ok := idx.Collection.(*hclsyntax.ScopeTraversalExpr)
+		if !ok {
+			return nil, false
+		}
+		tr := append(hcl.Traversal{}, coll.Traversal...)
+		tr = append(tr, hcl.TraverseIndex{Key: cty.DynamicVal, SrcRange: idx.BracketRange})
+		return append(tr, e.Traversal...), true
+	}
+	return nil, false
+}
+
+// providerAddressRanges collects the ranges of the provider references
+// (such as local.secondary or random.by_key) and of the object keys in a
+// provider or providers meta-argument, which look like values but are
+// not.
+func providerAddressRanges(expr hclsyntax.Expression, ranges map[hcl.Range]bool) map[hcl.Range]bool {
+	switch e := expr.(type) {
+	case *hclsyntax.ScopeTraversalExpr:
+		ranges[e.SrcRange] = true
+	case *hclsyntax.IndexExpr:
+		providerAddressRanges(e.Collection, ranges)
+	case *hclsyntax.ObjectConsExpr:
+		for _, item := range e.Items {
+			ranges[item.KeyExpr.Range()] = true
+			providerAddressRanges(item.ValueExpr, ranges)
+		}
+	}
+	return ranges
 }
 
 func isProviderMetaArgument(blockType, attrName string) bool {
@@ -828,7 +1340,12 @@ func movedBlock(src []byte, from, to lang.Address) string {
 	if len(src) > 0 && src[len(src)-1] != '\n' {
 		prefix = "\n\n"
 	}
-	return fmt.Sprintf("%smoved {\n  from = %s\n  to   = %s\n}\n", prefix, from.String(), to.String())
+	block := fmt.Sprintf("%smoved {\n  from = %s\n  to   = %s\n}\n", prefix, from.String(), to.String())
+	if bytes.Contains(src, []byte("\r\n")) {
+		// keep the file's line endings
+		block = strings.ReplaceAll(block, "\n", "\r\n")
+	}
+	return block
 }
 
 type editSet struct {

@@ -25,6 +25,7 @@ func (svc *service) DidChangeWorkspaceFolders(ctx context.Context, params lsp.Di
 			})
 			continue
 		}
+		svc.workspace.remove(document.DirHandleFromURI(removed.URI).Path())
 		svc.removeIndexedModule(ctx, removed.URI)
 	}
 
@@ -37,6 +38,7 @@ func (svc *service) DidChangeWorkspaceFolders(ctx context.Context, params lsp.Di
 			})
 			continue
 		}
+		svc.workspace.add(document.DirHandleFromURI(added.URI).Path())
 		svc.indexNewModule(ctx, added.URI)
 	}
 

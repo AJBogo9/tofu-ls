@@ -48,9 +48,19 @@ func startNavigationServer(t *testing.T, files map[string]string) (navigationSer
 }
 
 func startNavigationServerWithOptions(t *testing.T, files map[string]string, initOptions string) (navigationServer, document.DirHandle, func()) {
+	return startNavigationServerOpening(t, files, initOptions)
+}
+
+// startNavigationServerOpening also opens the files named in open, besides
+// main.tf.
+func startNavigationServerOpening(t *testing.T, files map[string]string, initOptions string, open ...string) (navigationServer, document.DirHandle, func()) {
 	tmpDir := TempDir(t)
 	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(tmpDir.Path(), name), []byte(content), 0o644); err != nil {
+		path := filepath.Join(tmpDir.Path(), filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -115,6 +125,18 @@ func startNavigationServerWithOptions(t *testing.T, files map[string]string, ini
 			"uri": "%s/main.tf"
 		}
 	}`, files["main.tf"], tmpDir.URI)})
+	for _, name := range open {
+		ls.Call(t, &langserver.CallRequest{
+			Method: "textDocument/didOpen",
+			ReqParams: fmt.Sprintf(`{
+		"textDocument": {
+			"version": 0,
+			"languageId": "opentofu",
+			"text": %q,
+			"uri": "%s/%s"
+		}
+	}`, files[name], tmpDir.URI, name)})
+	}
 	waitForAllJobs(t, ss)
 
 	return ls, tmpDir, stop
@@ -436,4 +458,342 @@ moved {
 				}
 			}
 		}`, tmpDir.URI))
+}
+
+func TestRename_emojiLine(t *testing.T) {
+	ls, tmpDir, stop := startNavigationServer(t, map[string]string{
+		"main.tf": navigationMainTf + "\nlocals {\n  rocket = \"\U0001F680 ${var.stage}\"\n}\n",
+	})
+	defer stop()
+
+	// LSP counts the emoji as two UTF-16 code units, HCL as one column
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/prepareRename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": {"line": 17, "character": 23}
+		}`, tmpDir.URI)}, `{
+			"jsonrpc": "2.0",
+			"id": 3,
+			"result": {
+				"range": {"start": {"line": 17, "character": 21}, "end": {"line": 17, "character": 26}},
+				"placeholder": "stage"
+			}
+		}`)
+
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/rename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": {"line": 17, "character": 23},
+			"newName": "tier"
+		}`, tmpDir.URI)}, fmt.Sprintf(`{
+			"jsonrpc": "2.0",
+			"id": 4,
+			"result": {
+				"changes": {
+					"%s/main.tf": [
+						{"range": {"start": {"line": 0, "character": 10}, "end": {"line": 0, "character": 15}}, "newText": "tier"},
+						{"range": {"start": {"line": 5, "character": 20}, "end": {"line": 5, "character": 25}}, "newText": "tier"},
+						{"range": {"start": {"line": 17, "character": 21}, "end": {"line": 17, "character": 26}}, "newText": "tier"}
+					]
+				}
+			}
+		}`, tmpDir.URI))
+}
+
+func TestRename_variableInSubdirVarFiles(t *testing.T) {
+	ls, tmpDir, stop := startNavigationServer(t, map[string]string{
+		"main.tf":                navigationMainTf,
+		"terraform.tfvars":       "stage = \"prod\"\n",
+		"envs/blue.tfvars":       "# blue\nstage = \"blue\"\n",
+		"envs/green.tfvars.json": `{"stage": "green"}`,
+		// a module of its own: its var files set its own variables
+		"other/main.tf":          "variable \"stage\" {}\n",
+		"other/terraform.tfvars": "stage = \"other\"\n",
+	})
+	defer stop()
+
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/rename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": {"line": 5, "character": 20},
+			"newName": "tier"
+		}`, tmpDir.URI)}, fmt.Sprintf(`{
+			"jsonrpc": "2.0",
+			"id": 3,
+			"result": {
+				"changes": {
+					"%s/envs/blue.tfvars": [
+						{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 5}}, "newText": "tier"}
+					],
+					"%s/envs/green.tfvars.json": [
+						{"range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 7}}, "newText": "tier"}
+					],
+					"%s/main.tf": [
+						{"range": {"start": {"line": 0, "character": 10}, "end": {"line": 0, "character": 15}}, "newText": "tier"},
+						{"range": {"start": {"line": 5, "character": 20}, "end": {"line": 5, "character": 25}}, "newText": "tier"}
+					],
+					"%s/terraform.tfvars": [
+						{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}}, "newText": "tier"}
+					]
+				}
+			}
+		}`, tmpDir.URI, tmpDir.URI, tmpDir.URI, tmpDir.URI))
+}
+
+func TestRename_outputWithIndexedModuleCalls(t *testing.T) {
+	ls, tmpDir, stop := startNavigationServerOpening(t, map[string]string{
+		"main.tf": `module "counted" {
+  count  = 2
+  source = "./app"
+}
+module "keyed" {
+  for_each = toset(["a", "b"])
+  source   = "./app"
+}
+locals {
+  all   = module.counted[*].first_port
+  first = module.counted[0].first_port
+  a     = module.keyed["a"].first_port
+  k     = module.keyed[local.key].first_port
+  key   = "a"
+}
+`,
+		"app/outputs.tf": "output \"first_port\" {\n  value = 80\n}\n",
+	}, "{}", "app/outputs.tf")
+	defer stop()
+
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/rename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/app/outputs.tf"},
+			"position": {"line": 0, "character": 10},
+			"newName": "port"
+		}`, tmpDir.URI)}, fmt.Sprintf(`{
+			"jsonrpc": "2.0",
+			"id": 4,
+			"result": {
+				"changes": {
+					"%s/app/outputs.tf": [
+						{"range": {"start": {"line": 0, "character": 8}, "end": {"line": 0, "character": 18}}, "newText": "port"}
+					],
+					"%s/main.tf": [
+						{"range": {"start": {"line": 9, "character": 28}, "end": {"line": 9, "character": 38}}, "newText": "port"},
+						{"range": {"start": {"line": 10, "character": 28}, "end": {"line": 10, "character": 38}}, "newText": "port"},
+						{"range": {"start": {"line": 11, "character": 28}, "end": {"line": 11, "character": 38}}, "newText": "port"},
+						{"range": {"start": {"line": 12, "character": 34}, "end": {"line": 12, "character": 44}}, "newText": "port"}
+					]
+				}
+			}
+		}`, tmpDir.URI, tmpDir.URI))
+}
+
+func TestRename_outputRefusesForExpression(t *testing.T) {
+	ls, tmpDir, stop := startNavigationServerOpening(t, map[string]string{
+		"main.tf": `module "keyed" {
+  for_each = toset(["a", "b"])
+  source   = "./app"
+}
+locals {
+  ports = [for k, m in module.keyed : m.first_port]
+}
+`,
+		"app/outputs.tf": "output \"first_port\" {\n  value = 80\n}\n",
+	}, "{}", "app/outputs.tf")
+	defer stop()
+
+	ls.CallAndExpectError(t, &langserver.CallRequest{
+		Method: "textDocument/rename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/app/outputs.tf"},
+			"position": {"line": 0, "character": 10},
+			"newName": "port"
+		}`, tmpDir.URI)}, &jrpc2.Error{Code: jrpc2.Code(-32098), Message: "module.keyed is iterated by a for expression (../main.tf:6), whose uses of first_port cannot be renamed safely; rename them by hand"})
+}
+
+func TestRename_refusesMovedAndRemovedHistory(t *testing.T) {
+	history := `
+moved {
+  from = terraform_data.api
+  to   = terraform_data.web
+}
+moved {
+  from = terraform_data.older
+  to   = terraform_data.other
+}
+removed {
+  from = terraform_data.retired
+  lifecycle {
+    destroy = false
+  }
+}
+`
+	testCases := []struct {
+		newName string
+		wantErr string
+	}{
+		{"api", "the moved block at main.tf:17 moves terraform_data.api to terraform_data.web, so renaming back would make a cycle; delete that moved block first if it has not been applied, or pick another name"},
+		{"older", "terraform_data.older is the from address of a moved block (main.tf:21), so OpenTofu would move the renamed object; pick another name"},
+		{"retired", "terraform_data.retired is the from address of a removed block (main.tf:25), so OpenTofu would remove the renamed object; pick another name"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.newName, func(t *testing.T) {
+			ls, tmpDir, stop := startNavigationServer(t, map[string]string{
+				"main.tf": navigationMainTf + history,
+			})
+			defer stop()
+
+			ls.CallAndExpectError(t, &langserver.CallRequest{
+				Method: "textDocument/rename",
+				ReqParams: fmt.Sprintf(`{
+					"textDocument": {"uri": "%s/main.tf"},
+					"position": {"line": 8, "character": 28},
+					"newName": %q
+				}`, tmpDir.URI, tc.newName)}, &jrpc2.Error{Code: jrpc2.Code(-32098), Message: tc.wantErr})
+		})
+	}
+}
+
+func TestRename_overrideAndTestFiles(t *testing.T) {
+	files := map[string]string{
+		"main.tf":     navigationMainTf,
+		"override.tf": "resource \"terraform_data\" \"web\" {\n  input = \"x\"\n}\n",
+		"tests/main.tftest.hcl": `variables {
+  stage = "test"
+}
+run "check" {
+  command = plan
+  variables {
+    stage = "dev"
+  }
+  assert {
+    condition     = terraform_data.web.input == "app-dev" && var.stage == "dev"
+    error_message = "wrong input"
+  }
+}
+`,
+	}
+	ls, tmpDir, stop := startNavigationServerWithOptions(t, files, `{"rename": {"addMovedBlock": false}}`)
+	defer stop()
+
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/rename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": {"line": 8, "character": 28},
+			"newName": "api"
+		}`, tmpDir.URI)}, fmt.Sprintf(`{
+			"jsonrpc": "2.0",
+			"id": 3,
+			"result": {
+				"changes": {
+					"%s/main.tf": [
+						{"range": {"start": {"line": 8, "character": 27}, "end": {"line": 8, "character": 30}}, "newText": "api"},
+						{"range": {"start": {"line": 13, "character": 25}, "end": {"line": 13, "character": 28}}, "newText": "api"}
+					],
+					"%s/override.tf": [
+						{"range": {"start": {"line": 0, "character": 27}, "end": {"line": 0, "character": 30}}, "newText": "api"}
+					],
+					"%s/tests/main.tftest.hcl": [
+						{"range": {"start": {"line": 9, "character": 35}, "end": {"line": 9, "character": 38}}, "newText": "api"}
+					]
+				}
+			}
+		}`, tmpDir.URI, tmpDir.URI, tmpDir.URI))
+
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/rename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": {"line": 0, "character": 12},
+			"newName": "tier"
+		}`, tmpDir.URI)}, fmt.Sprintf(`{
+			"jsonrpc": "2.0",
+			"id": 4,
+			"result": {
+				"changes": {
+					"%s/main.tf": [
+						{"range": {"start": {"line": 0, "character": 10}, "end": {"line": 0, "character": 15}}, "newText": "tier"},
+						{"range": {"start": {"line": 5, "character": 20}, "end": {"line": 5, "character": 25}}, "newText": "tier"}
+					],
+					"%s/tests/main.tftest.hcl": [
+						{"range": {"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 7}}, "newText": "tier"},
+						{"range": {"start": {"line": 6, "character": 4}, "end": {"line": 6, "character": 9}}, "newText": "tier"},
+						{"range": {"start": {"line": 9, "character": 65}, "end": {"line": 9, "character": 70}}, "newText": "tier"}
+					]
+				}
+			}
+		}`, tmpDir.URI, tmpDir.URI))
+}
+
+func TestRename_refusesModuleOutsideWorkspace(t *testing.T) {
+	// the module lives next to the workspace folder, as in a monorepo
+	// opened at envs/prod: other callers of it cannot be seen
+	shared := filepath.Join(os.TempDir(), "tofu-ls", t.Name()+"-shared")
+	if err := os.MkdirAll(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(shared) })
+	if err := os.WriteFile(filepath.Join(shared, "variables.tf"), []byte("variable \"replicas\" {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ls, tmpDir, stop := startNavigationServer(t, map[string]string{
+		"main.tf": fmt.Sprintf("module \"app\" {\n  source   = \"../%s\"\n  replicas = 1\n}\n", filepath.Base(shared)),
+	})
+	defer stop()
+
+	ls.CallAndExpectError(t, &langserver.CallRequest{
+		Method: "textDocument/prepareRename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": {"line": 2, "character": 4}
+		}`, tmpDir.URI)}, &jrpc2.Error{Code: jrpc2.Code(-32098), Message: fmt.Sprintf("var.replicas is declared in %s, outside the workspace, where other callers of the module cannot be seen; open that folder to rename it", shared)})
+}
+
+func TestRename_checkScopedData(t *testing.T) {
+	ls, tmpDir, stop := startNavigationServer(t, map[string]string{
+		"main.tf": `check "motd" {
+  data "local_file" "check_motd" {
+    filename = "motd.txt"
+  }
+  assert {
+    condition     = data.local_file.check_motd.content != ""
+    error_message = "empty"
+  }
+}
+`,
+	})
+	defer stop()
+
+	want := fmt.Sprintf(`{
+			"jsonrpc": "2.0",
+			"id": %%d,
+			"result": {
+				"changes": {
+					"%s/main.tf": [
+						{"range": {"start": {"line": 1, "character": 21}, "end": {"line": 1, "character": 31}}, "newText": "motd_file"},
+						{"range": {"start": {"line": 5, "character": 36}, "end": {"line": 5, "character": 46}}, "newText": "motd_file"}
+					]
+				}
+			}
+		}`, tmpDir.URI)
+	// from the reference in the assertion
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/rename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": {"line": 5, "character": 38},
+			"newName": "motd_file"
+		}`, tmpDir.URI)}, fmt.Sprintf(want, 3))
+	// from the label of the declaration
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/rename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": {"line": 1, "character": 25},
+			"newName": "motd_file"
+		}`, tmpDir.URI)}, fmt.Sprintf(want, 4))
 }

@@ -55,7 +55,7 @@ func (svc *service) TextDocumentInlayHint(ctx context.Context, params lsp.InlayH
 		return nil, err
 	}
 	for _, h := range ev.InlayHints(doc.Filename, rng, svc.inlayHints.MaxLength) {
-		pos := ilsp.HCLPosToLSP(h.Pos)
+		pos := ilsp.HCLPosToLSPInText(h.Pos, doc.Text)
 		hints = append(hints, lsp.InlayHint{
 			Position: &pos,
 			Label: []lsp.InlayHintLabelPart{{

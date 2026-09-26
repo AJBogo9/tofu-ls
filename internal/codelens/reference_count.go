@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/hashicorp/hcl-lang/decoder"
 	"github.com/hashicorp/hcl-lang/lang"
@@ -29,10 +30,13 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 			return nil, err
 		}
 
-		pathReader, err := decoder.PathReaderFromContext(ctx)
+		reader, err := decoder.PathReaderFromContext(ctx)
 		if err != nil {
 			return nil, err
 		}
+		// Counting asks for the context of every path once per target;
+		// building one is not free, so they are built once per request.
+		pathReader := newCachedPathReader(reader)
 
 		refTargets := localCtx.ReferenceTargets.OutermostInFile(file)
 		if err != nil {
@@ -56,7 +60,13 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 		var unused map[string]bool
 
 		for rng, refTargets := range dedupedTargets {
-			originCount := 0
+			if err := ctx.Err(); err != nil {
+				// the request was cancelled, for example by an edit
+				return nil, err
+			}
+			// targets sharing a range can be reached by the same origin,
+			// which counts once
+			seen := make(map[originKey]string)
 			var defRange *hcl.Range
 			for _, refTarget := range refTargets {
 				if refTarget.DefRangePtr != nil {
@@ -65,8 +75,11 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 
 				// resolved origins only: e.g. local.x does not count
 				// towards a provider named "local"
-				originCount += len(decoder.OriginsTargeting(ctx, pathReader, refTarget, path))
+				for _, po := range decoder.OriginsTargeting(ctx, pathReader, refTarget, path) {
+					seen[originKey{path: po.Path, rng: po.Origin.OriginRange()}] = originKind(po, refTarget, path)
+				}
 			}
+			originCount := len(seen)
 
 			if originCount == 0 {
 				if !showZeroReferences(refTargets) {
@@ -92,7 +105,7 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 			lenses = append(lenses, lang.CodeLens{
 				Range: rng,
 				Command: lang.Command{
-					Title: getTitle("reference", "references", originCount),
+					Title: getTitle("reference", "references", originCount) + nonUseSuffix(seen),
 					ID:    showReferencesCmdId,
 					Arguments: []lang.CommandArgument{
 						Position(ilsp.HCLPosToLSP(hclPos)),
@@ -108,6 +121,105 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 
 		return lenses, nil
 	}
+}
+
+// Kinds of references that set or check a variable without using its
+// value in an expression, which the unused hint does not count either.
+const (
+	originUse        = ""
+	originVarsFile   = "tfvars"
+	originModuleArg  = "module arguments"
+	originValidation = "own validation"
+)
+
+// originKind classifies an origin of a lens's target. Only variables
+// have references which are not uses: an output's references from
+// module calls (module.x.out) are uses.
+func originKind(po decoder.PathOrigin, target reference.Target, path lang.Path) string {
+	if len(target.Addr) == 0 || target.Addr[0].String() != "var" {
+		return originUse
+	}
+	switch po.Origin.(type) {
+	case reference.PathOrigin:
+		if po.Path.LanguageID != path.LanguageID {
+			return originVarsFile
+		}
+		return originModuleArg
+	case reference.LocalOrigin:
+		rng := po.Origin.OriginRange()
+		if po.Path.Equals(path) && target.RangePtr != nil && target.RangePtr.Filename == rng.Filename &&
+			target.RangePtr.ContainsOffset(rng.Start.Byte) {
+			// var.x in the validation of variable "x"
+			return originValidation
+		}
+	}
+	return originUse
+}
+
+// nonUseSuffix explains a count whose references are none of them uses
+// in expressions, e.g. " (tfvars only)", so that it agrees with a faded
+// "declared but not used" name.
+func nonUseSuffix(kinds map[originKey]string) string {
+	if len(kinds) == 0 {
+		return ""
+	}
+	found := make(map[string]bool)
+	for _, kind := range kinds {
+		if kind == originUse {
+			return ""
+		}
+		found[kind] = true
+	}
+	names := make([]string, 0, len(found))
+	for _, kind := range []string{originVarsFile, originModuleArg, originValidation} {
+		if found[kind] {
+			names = append(names, kind)
+		}
+	}
+	if len(names) == 1 {
+		return " (" + names[0] + " only)"
+	}
+	return " (" + strings.Join(names, ", ") + " only)"
+}
+
+// originKey identifies an origin across the targets of one lens.
+type originKey struct {
+	path lang.Path
+	rng  hcl.Range
+}
+
+// cachedPathReader remembers the paths and path contexts it has read.
+// It is meant for one request, during which the indexed modules do not
+// change.
+type cachedPathReader struct {
+	reader decoder.PathReader
+	paths  []lang.Path
+	ctxs   map[lang.Path]cachedPathContext
+}
+
+type cachedPathContext struct {
+	pathCtx *decoder.PathContext
+	err     error
+}
+
+func newCachedPathReader(reader decoder.PathReader) *cachedPathReader {
+	return &cachedPathReader{reader: reader, ctxs: make(map[lang.Path]cachedPathContext)}
+}
+
+func (r *cachedPathReader) Paths(ctx context.Context) []lang.Path {
+	if r.paths == nil {
+		r.paths = r.reader.Paths(ctx)
+	}
+	return r.paths
+}
+
+func (r *cachedPathReader) PathContext(path lang.Path) (*decoder.PathContext, error) {
+	if c, ok := r.ctxs[path]; ok {
+		return c.pathCtx, c.err
+	}
+	pathCtx, err := r.reader.PathContext(path)
+	r.ctxs[path] = cachedPathContext{pathCtx: pathCtx, err: err}
+	return pathCtx, err
 }
 
 // showZeroReferences tells whether "0 references" is worth showing:

@@ -85,6 +85,21 @@ func (ev *Evaluator) VarsFileHover(filename string, file *hcl.File, pos hcl.Pos)
 		switch {
 		case ok && winner == filename:
 			b.WriteString("**This value is used**: no automatically loaded file after it sets the variable.\n\n")
+		case ok && winner == "default" && val.IsNull() && !v.Nullable:
+			if v.Sensitive {
+				b.WriteString("The variable is not nullable, so OpenTofu replaces this `null` with the default.\n\n")
+			} else {
+				winVal, _, _ := v.Effective()
+				fmt.Fprintf(&b, "The variable is not nullable, so OpenTofu replaces this `null` with the default, `%s`.\n\n", FormatCompact(winVal, 40))
+			}
+		case ok && winner == "default":
+			// a later file's value did not convert, so the default wins
+			if v.Sensitive {
+				b.WriteString("**Overridden** by the default.\n\n")
+			} else {
+				winVal, _, _ := v.Effective()
+				fmt.Fprintf(&b, "**Overridden** by the default, `%s`.\n\n", FormatCompact(winVal, 40))
+			}
 		case ok:
 			if v.Sensitive {
 				fmt.Fprintf(&b, "**Overridden** by `%s`.\n\n", winner)

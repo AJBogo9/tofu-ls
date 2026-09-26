@@ -79,6 +79,29 @@ resource "local_file" "f" {
 			[]string{"local secondary main.tf:2:3-2:12"},
 		},
 		{
+			"instance keys of provider references are values",
+			map[string]string{
+				"main.tf": `locals {
+  pk = "a"
+  mk = "b"
+}
+provider "random" {
+  alias    = "by_key"
+  for_each = toset(["a", "b"])
+}
+resource "random_id" "keyed" {
+  provider    = random.by_key[local.pk]
+  byte_length = 2
+}
+module "m" {
+  source    = "./m"
+  providers = { random = random.by_key[local.mk] }
+}
+`,
+			},
+			[]string{},
+		},
+		{
 			"a JSON file means no report",
 			map[string]string{
 				"main.tf":       `variable "unused" {}`,

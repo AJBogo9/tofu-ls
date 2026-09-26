@@ -25,8 +25,14 @@ func (svc *service) PrepareRename(ctx context.Context, params lsp.PrepareRenameP
 		return nil, err
 	}
 
+	dh := ilsp.HandleFromDocumentURI(params.TextDocument.URI)
+	doc, err := svc.stateStore.DocumentStore.GetDocument(dh)
+	if err != nil {
+		return nil, err
+	}
+
 	return &lsp.PrepareRenameResult{
-		Range:       ilsp.HCLRangeToLSP(sym.CursorRange),
+		Range:       ilsp.HCLRangeToLSPInText(sym.CursorRange, doc.Text),
 		Placeholder: sym.Name,
 	}, nil
 }
@@ -45,10 +51,18 @@ func (svc *service) Rename(ctx context.Context, params lsp.RenameParams) (*lsp.W
 	}
 
 	changes := make(map[lsp.DocumentURI][]lsp.TextEdit, 0)
+	texts := make(map[string][]byte)
 	for _, edit := range edits {
+		// LSP counts characters in UTF-16 code units, so the edit ranges
+		// are converted with the text of their file.
+		text, ok := texts[edit.File]
+		if !ok {
+			text, _ = svc.fs.ReadFile(filepath.Clean(edit.File))
+			texts[edit.File] = text
+		}
 		docURI := lsp.DocumentURI(uri.FromPath(edit.File))
 		changes[docURI] = append(changes[docURI], lsp.TextEdit{
-			Range:   ilsp.HCLRangeToLSP(edit.Range),
+			Range:   ilsp.HCLRangeToLSPInText(edit.Range, text),
 			NewText: edit.NewText,
 		})
 	}
@@ -91,6 +105,8 @@ func (svc *service) refactorEnv() refactor.Env {
 			return svc.fs.ReadFile(filepath.Clean(path))
 		},
 		ModuleCalls: svc.features.Modules.DeclaredModuleCalls,
+		ReadDir:     svc.fs.ReadDir,
+		InWorkspace: svc.workspace.contains,
 	}
 }
 

@@ -51,7 +51,7 @@ func (svc *service) DocumentHighlight(ctx context.Context, params lsp.DocumentHi
 		}
 		seen[rng] = true
 		highlights = append(highlights, lsp.DocumentHighlight{
-			Range: ilsp.HCLRangeToLSP(rng),
+			Range: ilsp.HCLRangeToLSPInText(rng, doc.Text),
 			Kind:  kind,
 		})
 	}

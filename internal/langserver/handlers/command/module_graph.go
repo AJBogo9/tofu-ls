@@ -15,9 +15,11 @@ import (
 	"github.com/creachadair/jrpc2"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/opentofu/tofu-ls/internal/features/modules/ast"
 	"github.com/opentofu/tofu-ls/internal/langserver/cmd"
 	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 	lsp "github.com/opentofu/tofu-ls/internal/protocol"
+	globalAst "github.com/opentofu/tofu-ls/internal/tofu/ast"
 	"github.com/opentofu/tofu-ls/internal/uri"
 	"github.com/zclconf/go-cty/cty"
 )
@@ -38,6 +40,16 @@ type moduleGraphResponse struct {
 	ModuleURI     string            `json:"module_uri"`
 	Nodes         []moduleGraphNode `json:"nodes"`
 	Edges         []moduleGraphEdge `json:"edges"`
+	// ParseErrors are the syntax errors of the module's files. The parser
+	// drops what follows an error, so with any of them the graph may be
+	// missing declarations and references.
+	ParseErrors []moduleGraphParseError `json:"parse_errors,omitempty"`
+}
+
+type moduleGraphParseError struct {
+	URI     string    `json:"uri"`
+	Range   lsp.Range `json:"range"`
+	Message string    `json:"message"`
 }
 
 type moduleGraphNode struct {
@@ -160,7 +172,43 @@ func (h *CmdHandler) ModuleGraphHandler(ctx context.Context, args cmd.CommandArg
 		return dir, child.ParsedModuleFiles.AsMap()
 	}
 
-	return buildModuleGraph(modPath, mod.ParsedModuleFiles.AsMap(), childFiles), nil
+	response = buildModuleGraph(modPath, mod.ParsedModuleFiles.AsMap(), childFiles)
+	response.ParseErrors = moduleGraphParseErrors(modPath, mod.ModuleDiagnostics[globalAst.HCLParsingSource])
+	return response, nil
+}
+
+// moduleGraphParseErrors lists the error diagnostics of parsing, sorted
+// by file and position.
+func moduleGraphParseErrors(modPath string, diags ast.ModDiags) []moduleGraphParseError {
+	errs := make([]moduleGraphParseError, 0)
+	for filename, fileDiags := range diags {
+		for _, diag := range fileDiags {
+			if diag.Severity != hcl.DiagError {
+				continue
+			}
+			pe := moduleGraphParseError{
+				URI:     uri.FromPath(filepath.Join(modPath, string(filename))),
+				Message: diag.Summary,
+			}
+			if diag.Detail != "" {
+				pe.Message += ": " + diag.Detail
+			}
+			if diag.Subject != nil {
+				pe.Range = ilsp.HCLRangeToLSP(*diag.Subject)
+			}
+			errs = append(errs, pe)
+		}
+	}
+	sort.SliceStable(errs, func(i, j int) bool {
+		if errs[i].URI != errs[j].URI {
+			return errs[i].URI < errs[j].URI
+		}
+		return errs[i].Range.Start.Line < errs[j].Range.Start.Line
+	})
+	if len(errs) == 0 {
+		return nil
+	}
+	return errs
 }
 
 func isLocalModuleSource(source string) bool {
@@ -349,6 +397,10 @@ func declarationsInBody(body *hclsyntax.Body, file *hcl.File, fileURI string) []
 				node.Name = block.Labels[0] + "." + alias
 			}
 			node.ID = "provider." + node.Name
+		case block.Type == "check" && len(block.Labels) == 1:
+			// its assertions (and scoped data sources) use other
+			// declarations, which must not look unused
+			node.Kind, node.Name, node.ID = "check", block.Labels[0], "check."+block.Labels[0]
 		case block.Type == "locals":
 			for _, attr := range sortedAttributes(block.Body) {
 				blocks = append(blocks, &graphBlock{

@@ -20,6 +20,9 @@ import (
 
 func (svc *service) DidChangeWatchedFiles(ctx context.Context, params lsp.DidChangeWatchedFilesParams) error {
 	svc.logger.Printf("Received changes %d", len(params.Changes))
+	// a file changed on disk (a tfvars file, an installed module) can
+	// change the values the inlay hints of open files show
+	defer svc.scheduleInlayHintRefresh()
 
 	for _, change := range params.Changes {
 		svc.logger.Printf("Received change event for %d: %s", change.Type, change.URI)

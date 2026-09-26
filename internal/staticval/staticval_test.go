@@ -618,3 +618,510 @@ func TestAddCallers_nested(t *testing.T) {
 		})
 	}
 }
+
+// writeTree writes files (relative path to content) under a new temporary
+// directory and returns it.
+func writeTree(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root := t.TempDir()
+	for name, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// treeEvaluator loads the module in dir the way the language server does,
+// with its callers and an environment that loads child modules.
+func treeEvaluator(t *testing.T, dir string, indexed func(string) []Caller) *Evaluator {
+	t.Helper()
+	mod, err := LoadModule(osFS{}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	AddCallers(osFS{}, mod, 3, indexed)
+	ev := NewEvaluator(mod)
+	ev.SetEnv(treeEnv)
+	return ev
+}
+
+var treeEnv = Env{
+	LoadModule: func(dir string) (*Module, error) { return LoadModule(osFS{}, dir) },
+	Attribute: func(blockType, typeName, attr string) (*AttributeInfo, bool) {
+		switch {
+		case blockType == "data" && typeName == "local_file" && attr == "content":
+			return &AttributeInfo{Type: "string", Computed: true}, true
+		case blockType == "resource" && typeName == "random_password" && attr == "length":
+			return &AttributeInfo{Type: "number", Required: true}, true
+		case blockType == "resource" && typeName == "random_password" && attr == "result":
+			return &AttributeInfo{Type: "string", Computed: true, Sensitive: true}, true
+		case blockType == "resource" && typeName == "terraform_data" && attr == "input":
+			return &AttributeInfo{Type: "dynamic", Optional: true}, true
+		case blockType == "resource" && typeName == "local_sensitive_file" && attr == "content":
+			return &AttributeInfo{Type: "string", Required: true, Sensitive: true}, true
+		}
+		return nil, false
+	},
+}
+
+func TestHoverAt_evaluationSemantics(t *testing.T) {
+	overrideTree := map[string]string{
+		"main.tf": `variable "db_password" {
+  type      = string
+  sensitive = true
+}
+variable "size" {
+  type    = number
+  default = 1
+}
+locals {
+  pw   = var.db_password
+  name = "from-main"
+  show = local.name
+  sz   = var.size
+}
+`,
+		"override.tf": `variable "db_password" {
+  description = "The database password."
+}
+variable "size" {
+  default = 5
+}
+`,
+		"a_override.tf":    "locals {\n  name = \"from-override\"\n}\n",
+		"terraform.tfvars": "db_password = \"OVERRIDE-LEAK-777\"\n",
+	}
+	childFilesTree := map[string]string{
+		"main.tf": `module "one" {
+  source = "./modules/child"
+  name   = "alpha"
+}
+locals {
+  r = module.one.greeting
+}
+`,
+		"modules/child/main.tf": `variable "name" {}
+locals {
+  has_motd = fileexists("${path.module}/motd.txt")
+  motd     = file("${path.module}/motd.txt")
+  greeting = templatefile("${path.module}/greet.tftpl", { name = var.name })
+  root_rel = file("${path.root}/modules/child/motd.txt")
+}
+output "greeting" {
+  value = local.greeting
+}
+`,
+		"modules/child/motd.txt":    "message of the day",
+		"modules/child/greet.tftpl": "Hello, ${name}!",
+	}
+	dataTree := map[string]string{
+		"main.tf": `resource "terraform_data" "a" {}
+resource "random_pet" "p" {}
+data "local_file" "dep" {
+  filename   = "${path.module}/exists.txt"
+  depends_on = [terraform_data.a]
+}
+data "local_file" "plain" {
+  filename = "exists.txt"
+}
+data "local_file" "arg" {
+  filename = "${random_pet.p.id}.txt"
+}
+locals {
+  c_dep   = data.local_file.dep.content
+  c_plain = data.local_file.plain.content
+  c_arg   = data.local_file.arg.content
+  pts     = plantimestamp()
+}
+resource "terraform_data" "per_line" {
+  count = length(split("\n", data.local_file.dep.content))
+  input = count.index
+}
+`,
+		"exists.txt": "x",
+	}
+	fileTree := map[string]string{
+		"main.tf": `locals {
+  missing     = file("${path.module}/missing.txt")
+  try_missing = try(file("${path.module}/missing.txt"), "fallback")
+  can_missing = can(file("missing.txt"))
+  outside     = file("/etc/hostname")
+}
+`,
+	}
+	callsTree := map[string]string{
+		"main.tf": `module "one" {
+  source = "./c"
+  name   = "alpha"
+}
+module "two" {
+  source = "./c"
+  name   = "beta"
+}
+module "many" {
+  source   = "./c"
+  for_each = toset(["x", "y"])
+  name     = each.key
+}
+`,
+		"c/main.tf": `variable "name" {}
+locals {
+  label = "${var.name}-x"
+}
+`,
+	}
+	nestedTree := map[string]string{
+		"main.tf": `module "one" {
+  source = "./child"
+}
+module "many" {
+  source   = "./child"
+  for_each = toset(["x"])
+  label    = each.key
+}
+module "counted" {
+  source = "./child"
+  count  = 2
+}
+locals {
+  g = module.one.grand_out
+  m = module.many["x"].grand_out
+  c = module.counted[1].grand_out
+}
+`,
+		"child/main.tf": `variable "label" {
+  default = "alpha"
+}
+module "grand" {
+  source = "./grand"
+  label  = var.label
+}
+output "grand_out" {
+  value = module.grand.shout
+}
+`,
+		"child/grand/main.tf": `variable "label" {}
+output "shout" {
+  value = upper(var.label)
+}
+`,
+	}
+	sensitiveTree := map[string]string{
+		"main.tf": `module "child_plain" {
+  source   = "./child2"
+  value_in = "public-a"
+}
+module "child_secret" {
+  source   = "./child2"
+  value_in = sensitive("public-a")
+}
+`,
+		"child2/main.tf": `variable "value_in" {}
+locals {
+  v = "v-${var.value_in}"
+}
+`,
+	}
+
+	budgetTree := map[string]string{
+		"main.tf": `locals {
+  big_list = [for a in range(1000) : [for b in range(1000) : a * b]]
+  small    = [for a in range(3) : [for b in range(2) : a * b]]
+}
+`,
+	}
+	cfgTree := map[string]string{
+		"main.tf": `resource "random_password" "p" {
+  length = 16
+}
+resource "terraform_data" "a" {
+  input = "configured-input"
+}
+resource "terraform_data" "n" {
+  count = 2
+  input = "counted-input"
+}
+resource "local_sensitive_file" "s" {
+  content = "hunter2"
+}
+locals {
+  pw_len = random_password.p.length
+  a_in   = terraform_data.a.input
+  pw_out = random_password.p.result
+  n_in   = terraform_data.n[0].input
+  secret = local_sensitive_file.s.content
+}
+`,
+	}
+	nullTree := map[string]string{
+		"main.tf": `variable "nn" {
+  default  = "nn-default"
+  nullable = false
+}
+locals {
+  v = var.nn
+}
+`,
+		"terraform.tfvars": "nn = null\n",
+	}
+	edgeTree := map[string]string{
+		"main.tf": `variable "n_str" {
+  type    = string
+  default = "3"
+}
+resource "terraform_data" "counted" {
+  count = var.n_str
+  input = count.index
+}
+resource "terraform_data" "nums" {
+  for_each = toset([1, 2])
+  input    = each.value
+}
+`,
+	}
+
+	testCases := []struct {
+		name    string
+		tree    map[string]string
+		dir     string
+		needle  string
+		want    []string
+		notWant []string
+	}{
+		{"override keeps sensitive", overrideTree, "", "var.db_password", []string{sensitiveText}, []string{"OVERRIDE-LEAK-777", "_any_"}},
+		{"override keeps the type", overrideTree, "", "var.size", []string{"_number_", "**Value** `5`"}, nil},
+		{"override local wins", overrideTree, "", "local.name", []string{`"from-override"`}, []string{`"from-main"`}},
+		{"child fileexists", childFilesTree, "modules/child", "has_motd", []string{"**Value** `true`"}, nil},
+		{"child file", childFilesTree, "modules/child", "motd     =", []string{"message of the day"}, []string{"after apply"}},
+		{"child templatefile", childFilesTree, "modules/child", "greeting =", []string{"Hello, alpha!"}, nil},
+		{"child path.root", childFilesTree, "modules/child", "root_rel", []string{"message of the day"}, nil},
+		{"root sees child output", childFilesTree, "", "  r =", []string{"Hello, alpha!"}, nil},
+		{"data with depends_on", dataTree, "", "c_dep", []string{"known after apply", "`terraform_data.a`"}, []string{"during the plan"}},
+		{"data read at plan", dataTree, "", "c_plain", []string{"known during the plan, which reads the data source"}, nil},
+		{"data with unknown argument", dataTree, "", "c_arg", []string{"known after apply", "`random_pet.p.id`"}, nil},
+		{"data attribute with depends_on", dataTree, "", "data.local_file.dep.content\n", []string{"computed: **known after apply**"}, []string{"read during the plan"}},
+		{"data attribute read at plan", dataTree, "", "data.local_file.plain.content", []string{"computed: read during the plan"}, nil},
+		{"plantimestamp", dataTree, "", "pts", []string{"known during the plan: depends on `plantimestamp()`"}, []string{"after apply"}},
+		{"count known after apply", dataTree, "", "count.index", []string{"OpenTofu cannot plan a `count`"}, []string{"known once the plan"}},
+		{"missing file", fileTree, "", "missing     =", []string{"not evaluated", "no file exists"}, []string{"after apply"}},
+		{"try missing file", fileTree, "", "try_missing", []string{`"fallback"`}, nil},
+		{"can missing file", fileTree, "", "can_missing", []string{"**Value** `false`"}, nil},
+		{"file outside the module", fileTree, "", "outside", []string{"not evaluated: reads a file outside the module"}, []string{"after apply"}},
+		{"per call with a for_each caller", callsTree, "c", "label =", []string{"- `module.one`: `\"alpha-x\"`", "- `module.two`: `\"beta-x\"`", "- `module.many`: not evaluated: module.many differs per instance"}, nil},
+		{"nested module output", nestedTree, "", "  g =", []string{"**Value** `\"ALPHA\"`"}, []string{"after apply"}},
+		{"module output of a for_each instance", nestedTree, "", "  m =", []string{"**Value** `\"X\"`"}, []string{"after apply"}},
+		{"module output of a count instance", nestedTree, "", "  c =", []string{"**Value** `\"ALPHA\"`"}, []string{"after apply"}},
+		{"reference to a for_each instance output", nestedTree, "", "module.many[\"x\"].grand_out", []string{"**Value** `\"X\"`"}, nil},
+		{"count converts a string", edgeTree, "", "count.index", []string{"3 instances"}, []string{"must be a number"}},
+		{"for_each rejects a set of numbers", edgeTree, "", "each.value", []string{"not evaluated: for_each must be a map or a set of strings, not set of number"}, []string{"2 instances"}},
+		{"non-nullable null in tfvars", nullTree, "", "var.nn", []string{"**Value** `\"nn-default\"` from the default", "`terraform.tfvars` sets `null`, which the default replaces because the variable is not nullable"}, nil},
+		{"child variable with a sensitive value", sensitiveTree, "child2", "var.value_in", []string{"`module.child_secret` (`../main.tf`): (sensitive)"}, []string{"`(sensitive)`"}},
+		{"nested for expressions over a budget", budgetTree, "", "big_list", []string{"not evaluated: its for expressions run about 1000000 iterations"}, nil},
+		{"nested for expressions within the budget", budgetTree, "", "small", []string{"**Value**", "[0, 0]"}, []string{"not evaluated"}},
+		{"configured argument", cfgTree, "", "pw_len", []string{"**Value** `16`"}, []string{"after apply"}},
+		{"configured optional argument", cfgTree, "", "a_in", []string{"**Value** `\"configured-input\"`"}, nil},
+		{"computed attribute", cfgTree, "", "pw_out", []string{"known after apply: depends on `random_password.p.result`"}, nil},
+		{"counted resource", cfgTree, "", "n_in", []string{"known after apply"}, []string{"counted-input"}},
+		{"sensitive argument", cfgTree, "", "secret", []string{sensitiveText}, []string{"hunter2"}},
+		{"equal call values keep sensitivity", sensitiveTree, "child2", "var.value_in", []string{"**Value** " + sensitiveText + " in all 2 module calls"}, nil},
+		{"local of equal call values keeps sensitivity", sensitiveTree, "child2", "  v =", []string{sensitiveText}, []string{"v-public-a"}},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeTree(t, tc.tree)
+			ev := treeEvaluator(t, filepath.Join(root, filepath.FromSlash(tc.dir)), nil)
+			h, ok := ev.HoverAt("main.tf", posOf(t, ev, "main.tf", tc.needle, 2), treeEnv)
+			if !ok {
+				t.Fatal("no hover")
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(h.Content, w) {
+					t.Errorf("hover lacks %q:\n%s", w, h.Content)
+				}
+			}
+			for _, w := range tc.notWant {
+				if strings.Contains(h.Content, w) {
+					t.Errorf("hover contains %q:\n%s", w, h.Content)
+				}
+			}
+		})
+	}
+}
+
+func TestInlayHints_equalCallValuesKeepSensitivity(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"main.tf": `module "child_plain" {
+  source   = "./child2"
+  value_in = "public-a"
+}
+module "child_secret" {
+  source   = "./child2"
+  value_in = sensitive("public-a")
+}
+`,
+		"child2/main.tf": `variable "value_in" {}
+locals {
+  v = "v-${var.value_in}"
+  w = local.v
+}
+`,
+	})
+	ev := treeEvaluator(t, filepath.Join(root, "child2"), nil)
+	for _, h := range ev.InlayHints("main.tf", hcl.Range{}, 40) {
+		if strings.Contains(h.Label, "public-a") {
+			t.Errorf("sensitive value in a hint: %s %s", h.Ref, h.Label)
+		}
+	}
+}
+
+func TestLoadModule_tofuFilesShadowTfFiles(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"main.tf":   "locals {\n  both    = \"from-tf\"\n  only_tf = \"only-in-tf\"\n}\n",
+		"main.tofu": "locals {\n  both = \"from-tofu\"\n}\n",
+		"other.tf":  "locals {\n  other = 1\n}\n",
+	})
+	ev := treeEvaluator(t, root, nil)
+	if _, ok := ev.Local("only_tf"); ok {
+		t.Error("main.tf should be ignored when main.tofu exists")
+	}
+	if _, ok := ev.Local("other"); !ok {
+		t.Error("other.tf has no .tofu twin and should be loaded")
+	}
+	if r := ev.EvalLocal("both"); !r.IsKnown() || r.Value.AsString() != "from-tofu" {
+		t.Errorf("unexpected local.both: %#v", r)
+	}
+}
+
+func TestAddCallers_rootWithTfvarsStaysRoot(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"main.tf": `variable "name" {
+  default = "default-name"
+}
+locals {
+  greeting = "hello-${var.name}"
+}
+`,
+		"terraform.tfvars": "name = \"root-tfvars\"\n",
+		"examples/basic/main.tf": `module "this" {
+  source = "../../"
+  name   = "example"
+}
+`,
+	})
+	indexed := func(dir string) []Caller {
+		parent, err := LoadModule(osFS{}, filepath.Join(root, "examples", "basic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []Caller{{Parent: parent, Name: "this"}}
+	}
+	ev := treeEvaluator(t, root, indexed)
+	if ev.Module().RootPath != "" {
+		t.Fatalf("a module with its own tfvars was classified as a child of %s", ev.Module().RootPath)
+	}
+	r := ev.EvalLocal("greeting")
+	if !r.IsKnown() || r.Value.AsString() != "hello-root-tfvars" {
+		t.Fatalf("unexpected local.greeting: %#v", r)
+	}
+}
+
+func TestVarsFileHover_nonNullableNull(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"main.tf":          "variable \"nn\" {\n  default  = \"nn-default\"\n  nullable = false\n}\n",
+		"terraform.tfvars": "nn = null\n",
+	})
+	ev := treeEvaluator(t, root, nil)
+	f := ev.Module().VarsFiles["terraform.tfvars"]
+	h, ok := ev.VarsFileHover("terraform.tfvars", f, hcl.Pos{Line: 1, Column: 2, Byte: 1})
+	if !ok {
+		t.Fatal("no hover")
+	}
+	want := "The variable is not nullable, so OpenTofu replaces this `null` with the default, `\"nn-default\"`."
+	if !strings.Contains(h.Content, want) {
+		t.Fatalf("hover lacks %q:\n%s", want, h.Content)
+	}
+	if strings.Contains(h.Content, "**Overridden** by `default`") {
+		t.Fatalf("hover names the default like a file:\n%s", h.Content)
+	}
+}
+
+func TestFormatValue_heredocRoundTrip(t *testing.T) {
+	testCases := []string{
+		"a\nb",
+		"a\nb\n",
+		"    x\n    y\n",
+		"x\n  y\n",
+		"first\nEOT\nlast\n",
+		"first\nEOT\nEOF\nEND\n",
+		"a\r\nb\n",
+		"${var.x}\n%{if true}y\n",
+		"\tx\ny\n",
+		"x\n\ny\n",
+	}
+	for _, want := range testCases {
+		t.Run(strings.ReplaceAll(want, "\n", "|"), func(t *testing.T) {
+			for _, v := range []cty.Value{
+				cty.StringVal(want),
+				cty.ObjectVal(map[string]cty.Value{"k": cty.StringVal(want), "other": cty.NumberIntVal(1)}),
+			} {
+				rendered := FormatValue(v)
+				src := "x = " + rendered + "\n"
+				f, diags := hclsyntax.ParseConfig([]byte(src), "t.tf", hcl.InitialPos)
+				if diags.HasErrors() {
+					t.Fatalf("rendering does not parse: %s\n%s", diags, src)
+				}
+				attrs, _ := f.Body.JustAttributes()
+				got, diags := attrs["x"].Expr.Value(nil)
+				if diags.HasErrors() {
+					t.Fatalf("rendering does not evaluate: %s\n%s", diags, src)
+				}
+				if got.Type().IsObjectType() {
+					got = got.GetAttr("k")
+				}
+				if got.AsString() != want {
+					t.Fatalf("rendering denotes %q, not %q:\n%s", got.AsString(), want, rendered)
+				}
+			}
+		})
+	}
+}
+
+func TestValueBlock_capsLargeValues(t *testing.T) {
+	elems := make([]cty.Value, 1000)
+	for i := range elems {
+		elems[i] = cty.NumberIntVal(int64(i))
+	}
+	got := valueBlock("**Value**", cty.TupleVal(elems), "")
+	if n := strings.Count(got, "\n"); n > maxValueLines+10 {
+		t.Fatalf("hover value has %d lines", n)
+	}
+	if !strings.Contains(got, "more lines") {
+		t.Fatalf("hover value does not say it was cut:\n%s", got)
+	}
+	long := valueBlock("**Value**", cty.StringVal(strings.Repeat("x", 100000)), "")
+	if len(long) > maxValueChars+100 {
+		t.Fatalf("hover value has %d bytes", len(long))
+	}
+}
+
+func TestParseFile_cacheFollowsContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "main.tf")
+	a := parseFile(path, []byte("locals {\n  a = 1\n}\n"))
+	again := parseFile(path, []byte("locals {\n  a = 1\n}\n"))
+	if a == nil || a != again {
+		t.Fatal("the same content should reuse the parsed file")
+	}
+	b := parseFile(path, []byte("locals {\n  a = 2\n}\n"))
+	if b == a {
+		t.Fatal("changed content must be parsed again")
+	}
+	attrs, _ := b.Body.(*hclsyntax.Body).Blocks[0].Body.JustAttributes()
+	if v, _ := attrs["a"].Expr.Value(nil); !v.RawEquals(cty.NumberIntVal(2)) {
+		t.Fatalf("unexpected value %#v", v)
+	}
+}

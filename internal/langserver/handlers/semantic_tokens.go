@@ -34,7 +34,7 @@ func (svc *service) TextDocumentSemanticTokensFull(ctx context.Context, params l
 		return tks, jrpc2.MethodNotFound.Err()
 	}
 
-	doc, tokens, err := svc.semanticTokensForDocument(ctx, params.TextDocument.URI)
+	doc, tokens, err := svc.semanticTokensForDocument(ctx, params.TextDocument.URI, 0, 0)
 	if err != nil {
 		return tks, err
 	}
@@ -68,14 +68,15 @@ func (svc *service) TextDocumentSemanticTokensRange(ctx context.Context, params 
 		return tks, jrpc2.MethodNotFound.Err()
 	}
 
-	doc, tokens, err := svc.semanticTokensForDocument(ctx, params.TextDocument.URI)
+	startLine, endLine := int(params.Range.Start.Line)+1, int(params.Range.End.Line)+1
+	doc, tokens, err := svc.semanticTokensForDocument(ctx, params.TextDocument.URI, startLine, endLine)
 	if err != nil {
 		return tks, err
 	}
 
 	te := &ilsp.TokenEncoder{
 		Lines:      doc.Lines,
-		Tokens:     tokensOnLines(tokens, int(params.Range.Start.Line)+1, int(params.Range.End.Line)+1),
+		Tokens:     tokensOnLines(tokens, startLine, endLine),
 		ClientCaps: cc.TextDocument.SemanticTokens,
 	}
 	tks.Data = te.Encode()
@@ -83,7 +84,10 @@ func (svc *service) TextDocumentSemanticTokensRange(ctx context.Context, params 
 	return tks, nil
 }
 
-func (svc *service) semanticTokensForDocument(ctx context.Context, uri lsp.DocumentURI) (*document.Document, []lang.SemanticToken, error) {
+// semanticTokensForDocument decodes the tokens of a document: all of them
+// when startLine is 0, else those of the top-level blocks and attributes
+// which touch the (1-based, inclusive) lines.
+func (svc *service) semanticTokensForDocument(ctx context.Context, uri lsp.DocumentURI, startLine, endLine int) (*document.Document, []lang.SemanticToken, error) {
 	dh := ilsp.HandleFromDocumentURI(uri)
 	doc, err := svc.stateStore.DocumentStore.GetDocument(dh)
 	if err != nil {
@@ -101,7 +105,12 @@ func (svc *service) semanticTokensForDocument(ctx context.Context, uri lsp.Docum
 		return nil, nil, err
 	}
 
-	tokens, err := d.SemanticTokensInFile(ctx, doc.Filename)
+	var tokens []lang.SemanticToken
+	if startLine > 0 {
+		tokens, err = d.SemanticTokensInLines(ctx, doc.Filename, startLine, endLine)
+	} else {
+		tokens, err = d.SemanticTokensInFile(ctx, doc.Filename)
+	}
 	if err != nil {
 		return nil, nil, err
 	}

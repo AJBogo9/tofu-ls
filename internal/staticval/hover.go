@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/convert"
 )
 
 // AttributeInfo describes a provider attribute for hover.
@@ -324,7 +325,7 @@ func (ev *Evaluator) callValuesText(v *Variable) string {
 		return b.String()
 	}
 	if val, ok := v.callValue(); ok {
-		if v.Sensitive {
+		if v.Sensitive || val.ContainsMarked() {
 			fmt.Fprintf(&b, "**Value** %s", sensitiveText)
 		} else {
 			b.WriteString(strings.TrimSuffix(valueBlock("**Value**", val, ""), "\n\n"))
@@ -365,9 +366,12 @@ func (ev *Evaluator) overriddenSources(v *Variable, winner string) string {
 		if a.File == winner {
 			continue
 		}
-		if v.Sensitive {
+		switch {
+		case a.Value.IsNull() && !v.Nullable && winner == "default":
+			parts = append(parts, fmt.Sprintf("`%s` sets `null`, which the default replaces because the variable is not nullable", a.File))
+		case v.Sensitive:
 			parts = append(parts, fmt.Sprintf("`%s`", a.File))
-		} else {
+		default:
 			parts = append(parts, fmt.Sprintf("`%s` sets `%s`", a.File, FormatCompact(a.Value, 40)))
 		}
 	}
@@ -439,8 +443,16 @@ type callResult struct {
 // with the variables that call passes.
 func (ev *Evaluator) perCall(fn func(child *Evaluator) Result) []callResult {
 	var out []callResult
+	parents := make(map[*Module]*Evaluator)
 	for _, c := range ev.mod.Callers {
-		parentEv := NewEvaluator(c.Parent)
+		parentEv, ok := parents[c.Parent]
+		if !ok {
+			parentEv = NewEvaluator(c.Parent)
+			if ev.host != nil {
+				parentEv.SetEnv(*ev.host)
+			}
+			parents[c.Parent] = parentEv
+		}
 		block := parentEv.findModuleCall(c.Name)
 		if block == nil {
 			continue
@@ -479,11 +491,17 @@ func resultBlock(label string, r Result) string {
 func unknownExplanation(r Result) string {
 	switch r.Kind {
 	case AfterApply:
+		if r.Detail != "" {
+			return fmt.Sprintf("known after apply: depends on `%s` (%s)", r.Reason, r.Detail)
+		}
 		return fmt.Sprintf("known after apply: depends on `%s`", r.Reason)
 	case NoInput:
 		return fmt.Sprintf("unknown: `%s` has no default or tfvars value", r.Reason)
 	case AtPlan:
-		return fmt.Sprintf("known once the plan reads the data source: depends on `%s`", r.Reason)
+		if strings.HasPrefix(r.Reason, "data.") {
+			return fmt.Sprintf("known during the plan, which reads the data source: depends on `%s`", r.Reason)
+		}
+		return fmt.Sprintf("known during the plan: depends on `%s`", r.Reason)
 	case PerCall:
 		return fmt.Sprintf("set by the module calls: depends on `%s`", r.Reason)
 	case NotEvaluated:
@@ -503,9 +521,9 @@ func valueLine(ref string, r Result) string {
 	case r.IsKnown():
 		s := FormatValue(r.Value)
 		if strings.Contains(s, "\n") {
-			return fmt.Sprintf("`%s` =\n```hcl\n%s\n```", ref, s)
+			return fmt.Sprintf("`%s` =\n```hcl\n%s\n```", ref, capValueText(s))
 		}
-		return fmt.Sprintf("`%s` = `%s`", ref, s)
+		return fmt.Sprintf("`%s` = `%s`", ref, truncate(s, maxValueChars))
 	}
 	return fmt.Sprintf("`%s`: %s", ref, unknownExplanation(r))
 }
@@ -518,12 +536,42 @@ func valueBlock(label string, v cty.Value, suffix string) string {
 		suffix = " " + suffix
 	}
 	if pretty, ok := prettyJSON(v); ok {
-		return fmt.Sprintf("%s (a JSON string)%s\n```json\n%s\n```\n\n", label, suffix, pretty)
+		return fmt.Sprintf("%s (a JSON string)%s\n```json\n%s\n```\n\n", label, suffix, capValueText(pretty))
 	}
 	if strings.Contains(s, "\n") {
-		return fmt.Sprintf("%s%s\n```hcl\n%s\n```\n\n", label, suffix, s)
+		return fmt.Sprintf("%s%s\n```hcl\n%s\n```\n\n", label, suffix, capValueText(s))
 	}
-	return fmt.Sprintf("%s `%s`%s\n\n", label, s, suffix)
+	return fmt.Sprintf("%s `%s`%s\n\n", label, truncate(s, maxValueChars), suffix)
+}
+
+// maxValueLines and maxValueChars cap a value shown in a hover, which
+// otherwise can be megabytes (a file() of a large JSON document).
+const (
+	maxValueLines = 60
+	maxValueChars = 6000
+)
+
+// capValueText keeps the first lines of a rendered value and says how
+// many are left out.
+func capValueText(s string) string {
+	lines := strings.Split(s, "\n")
+	cut := 0
+	if len(lines) > maxValueLines {
+		cut = len(lines) - maxValueLines
+		lines = lines[:maxValueLines]
+	}
+	out := strings.Join(lines, "\n")
+	if utf8.RuneCountInString(out) > maxValueChars {
+		out = string([]rune(out)[:maxValueChars])
+		if i := strings.LastIndex(out, "\n"); i > 0 {
+			out = out[:i]
+		}
+		cut = len(strings.Split(s, "\n")) - len(strings.Split(out, "\n"))
+	}
+	if cut > 0 {
+		out += fmt.Sprintf("\n… %d more %s", cut, plural(cut, "line", "lines"))
+	}
+	return out
 }
 
 // prettyJSON indents a string value that holds a JSON object or array,
@@ -649,6 +697,10 @@ func (ev *Evaluator) Instances(block *hclsyntax.Block) (string, Result, []Instan
 				k, e := it.Element()
 				insts = append(insts, Instance{Key: k, Value: e})
 			}
+		case ty.IsSetType() && ty.ElementType() != cty.String:
+			// OpenTofu rejects a set of numbers, for example, even
+			// though it could convert them
+			return "for_each", Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: "for_each must be a map or a set of strings, not " + ty.FriendlyName()}, nil, true
 		case ty.IsSetType():
 			for it := v.ElementIterator(); it.Next(); {
 				_, e := it.Element()
@@ -690,7 +742,12 @@ func convertInt(v cty.Value) (int, error) {
 		v, _ = v.Unmark()
 	}
 	if v.Type() != cty.Number {
-		return 0, fmt.Errorf("count must be a number")
+		// count converts, for example, the string "3"
+		n, err := convert.Convert(v, cty.Number)
+		if err != nil || n.IsNull() {
+			return 0, fmt.Errorf("count must be a number")
+		}
+		v = n
 	}
 	bf := v.AsBigFloat()
 	if !bf.IsInt() {
@@ -760,6 +817,9 @@ func (ev *Evaluator) iterationHover(body *hclsyntax.Body, expr *hclsyntax.ScopeT
 	}
 	if !r.IsKnown() {
 		fmt.Fprintf(&b, ": %s\n\n", unknownExplanation(r))
+		if r.Kind == AfterApply {
+			fmt.Fprintf(&b, "OpenTofu cannot plan a `%s` that is only known after apply.\n\n", meta)
+		}
 		return b.String(), true
 	}
 	if r.IsSensitive() {
@@ -857,7 +917,7 @@ func (ev *Evaluator) attributeHover(blockType string, t hcl.Traversal, typeStep 
 	case info.Optional:
 		flags = append(flags, "optional")
 	case info.Computed && blockType == "data":
-		flags = append(flags, "computed: read during the plan")
+		flags = append(flags, ev.dataComputedFlag(typeName, t, typeStep))
 	case info.Computed:
 		flags = append(flags, "computed: **known after apply**")
 	}
@@ -882,6 +942,24 @@ func (ev *Evaluator) attributeHover(blockType string, t hcl.Traversal, typeStep 
 		fmt.Fprintf(&b, "[`%s` documentation](%s)", typeName, info.DocsURL)
 	}
 	return strings.TrimSpace(b.String()), true
+}
+
+// dataComputedFlag says when a computed attribute of a data source is
+// known: during the plan, or after apply when the data source is read
+// during apply.
+func (ev *Evaluator) dataComputedFlag(typeName string, t hcl.Traversal, typeStep int) string {
+	name, ok := attrStep(t, typeStep+1)
+	if !ok {
+		return "computed"
+	}
+	r := ev.DataReadTiming(typeName, name)
+	switch r.Kind {
+	case AtPlan:
+		return "computed: read during the plan"
+	case AfterApply:
+		return "computed: **known after apply** (" + r.Detail + ")"
+	}
+	return "computed: read during the plan if its arguments are known then (" + unknownExplanation(r) + ")"
 }
 
 // configuredValue shows the value an attribute gets from the resource's
@@ -991,9 +1069,21 @@ func (ev *Evaluator) resolveModuleCall(block *hclsyntax.Block, env Env) (*module
 // childEvaluator returns an evaluator for the called module whose
 // variables take the values this module call passes.
 func (ev *Evaluator) childEvaluator(mc *moduleCall) *Evaluator {
+	return ev.childEvaluatorFor(mc, nil)
+}
+
+// childEvaluatorFor is childEvaluator for one instance of a call with
+// for_each or count, whose each or count values are given.
+func (ev *Evaluator) childEvaluatorFor(mc *moduleCall, each map[string]cty.Value) *Evaluator {
 	child := NewEvaluator(mc.child)
+	child.depth = ev.depth + 1
+	if ev.host != nil {
+		// Nested module calls evaluate their outputs too, up to
+		// maxModuleDepth levels.
+		child.SetEnv(*ev.host)
+	}
 	for name, v := range child.vars {
-		cv := ev.callValueFor(mc.block, v, mc.child.Path)
+		cv := ev.callValueForInstance(mc.block, v, mc.child.Path, each)
 		v.CallValues = []CallValue{cv}
 		delete(child.varCauses, name)
 		val := cv.Result.Value
@@ -1031,6 +1121,10 @@ func (m *Module) outputs() map[string]*outputDecl {
 		for _, block := range content.Blocks {
 			attrs, _ := block.Body.JustAttributes()
 			o := &outputDecl{name: block.Labels[0], file: fname}
+			if prev, ok := outs[o.name]; ok && IsOverrideFile(fname) {
+				// An override output merges into the primary one.
+				o = prev
+			}
 			if a, ok := attrs["description"]; ok {
 				if v, diags := a.Expr.Value(nil); !diags.HasErrors() && v.Type() == cty.String && !v.IsNull() {
 					o.description = v.AsString()
@@ -1038,7 +1132,7 @@ func (m *Module) outputs() map[string]*outputDecl {
 			}
 			if a, ok := attrs["sensitive"]; ok {
 				if v, diags := a.Expr.Value(nil); !diags.HasErrors() && v.Type() == cty.Bool && !v.IsNull() {
-					o.sensitive = v.True()
+					o.sensitive = o.sensitive || v.True()
 				}
 			}
 			if a, ok := attrs["value"]; ok {
@@ -1061,8 +1155,20 @@ func (ev *Evaluator) moduleOutputHover(expr *hclsyntax.ScopeTraversalExpr, env E
 	if block == nil {
 		return "", false
 	}
-	outName, hasOut := attrStep(t, 2)
+	// module.<call>[<key>].<output> refers to one instance
+	outStep := 2
+	var instanceKey cty.Value
+	if len(t) > 2 {
+		if idx, ok := t[2].(hcl.TraverseIndex); ok {
+			instanceKey = idx.Key
+			outStep = 3
+		}
+	}
+	outName, hasOut := attrStep(t, outStep)
 	if !hasOut {
+		if outStep == 3 {
+			return "", false
+		}
 		return ev.moduleCallHover(block, env), true
 	}
 	mc, ok := ev.resolveModuleCall(block, env)
@@ -1081,20 +1187,25 @@ func (ev *Evaluator) moduleOutputHover(expr *hclsyntax.ScopeTraversalExpr, env E
 		b.WriteString("\n\n")
 	}
 	if out.expr != nil {
+		_, hasForEach := block.Body.Attributes["for_each"]
+		_, hasCount := block.Body.Attributes["count"]
 		var r Result
-		if _, hasInstances := block.Body.Attributes["for_each"]; hasInstances {
+		switch {
+		case (hasForEach || hasCount) && instanceKey != cty.NilVal:
+			r = ev.instanceOutput(block, mc, out, instanceKey)
+		case hasForEach:
 			r = Result{Kind: NotEvaluated, Reason: "the module call has for_each"}
-		} else if _, hasInstances := block.Body.Attributes["count"]; hasInstances {
+		case hasCount:
 			r = Result{Kind: NotEvaluated, Reason: "the module call has count"}
-		} else {
+		default:
 			r = ev.childEvaluator(mc).Eval(out.expr, nil)
 		}
 		if out.sensitive && r.IsKnown() {
 			r.Value = r.Value.Mark(SensitiveMark)
 		}
-		if len(t) > 3 && r.IsKnown() {
+		if len(t) > outStep+1 && r.IsKnown() {
 			// A deeper reference, such as module.x.out.attr.
-			if sub, diags := t[3:].TraverseRel(r.Value); !diags.HasErrors() {
+			if sub, diags := t[outStep+1:].TraverseRel(r.Value); !diags.HasErrors() {
 				r.Value = sub
 			}
 		}
@@ -1106,6 +1217,24 @@ func (ev *Evaluator) moduleOutputHover(expr *hclsyntax.ScopeTraversalExpr, env E
 	}
 	fmt.Fprintf(&b, "_Defined in `%s`_", relPath(ev.mod.Path, filepath.Join(mc.dir, out.file)))
 	return b.String(), true
+}
+
+// instanceOutput evaluates an output for the instance with the given key
+// of a module call with for_each or count.
+func (ev *Evaluator) instanceOutput(block *hclsyntax.Block, mc *moduleCall, out *outputDecl, key cty.Value) Result {
+	_, r, insts, _ := ev.Instances(block)
+	if !r.IsKnown() {
+		return r
+	}
+	if r.IsSensitive() {
+		return Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: "the instances of the module call are sensitive"}
+	}
+	for _, inst := range insts {
+		if eq := inst.Key.Equals(key); eq.IsKnown() && eq.True() {
+			return ev.childEvaluatorFor(mc, inst.Each).Eval(out.expr, nil)
+		}
+	}
+	return Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: "the module call has no instance " + FormatCompact(key, 40)}
 }
 
 // outputHover shows an output of this module with its value.

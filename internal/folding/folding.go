@@ -86,14 +86,29 @@ func lastChar(rng hcl.Range) hcl.Pos {
 }
 
 // closed adds a range which ends with a closing delimiter at end.
-// The closing line stays visible when it holds nothing but the
-// delimiter (and indentation).
+// The closing line stays visible when it holds nothing but closing
+// delimiters (and indentation) before it, as in the }) that ends
+// merge(var.x, { ... }).
 func (c *collector) closed(startLine int, end hcl.Pos, kind string) {
 	endLine := end.Line
-	if end.Byte <= len(c.src) && onlyIndentBefore(c.src, end.Byte) {
+	if end.Byte <= len(c.src) && onlyClosersBefore(c.src, end.Byte) {
 		endLine--
 	}
 	c.add(startLine, endLine, kind)
+}
+
+func onlyClosersBefore(src []byte, offset int) bool {
+	for i := offset - 1; i >= 0; i-- {
+		switch src[i] {
+		case ' ', '\t', '}', ']', ')':
+			continue
+		case '\n':
+			return true
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func onlyIndentBefore(src []byte, offset int) bool {

@@ -235,6 +235,9 @@ func (svc *service) setupWalker(ctx context.Context, params lsp.InitializeParams
 	if err != nil {
 		return err
 	}
+	if rootURI != "" {
+		svc.workspace.add(root.Path())
+	}
 
 	if len(options.XLegacyModulePaths) != 0 {
 		jrpc2.ServerFromContext(ctx).Notify(ctx, "window/showMessage", &lsp.ShowMessageParams{
@@ -289,6 +292,7 @@ func (svc *service) setupWalker(ctx context.Context, params lsp.InitializeParams
 			}
 
 			modPath := document.DirHandleFromURI(folder.URI)
+			svc.workspace.add(modPath.Path())
 
 			err := svc.stateStore.WalkerPaths.EnqueueDir(ctx, modPath)
 			if err != nil {

@@ -14,6 +14,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/opentofu/tofu-ls/internal/features/modules/ast"
 	lsp "github.com/opentofu/tofu-ls/internal/protocol"
 	"github.com/opentofu/tofu-ls/internal/uri"
 )
@@ -276,6 +277,42 @@ variable "name" {}
 		},
 	}
 
+	tests = append(tests, struct {
+		name      string
+		files     map[string]string
+		wantNodes []string
+		wantEdges []string
+	}{
+		name: "check blocks use what their assertions reference",
+		files: map[string]string{
+			"main.tf": `variable "count_of" {}
+
+locals {
+  is_prod = true
+}
+
+check "workers" {
+  data "local_file" "motd" {
+    filename = "motd.txt"
+  }
+  assert {
+    condition     = local.is_prod && var.count_of > 0 && data.local_file.motd.content != ""
+    error_message = "no workers"
+  }
+}
+`,
+		},
+		wantNodes: []string{
+			"variable var.count_of @main.tf:1",
+			`local local.is_prod @main.tf:4 detail="true"`,
+			"check check.workers @main.tf:7",
+		},
+		wantEdges: []string{
+			"local.is_prod -> check.workers [assert.condition: local.is_prod @12:21]",
+			"var.count_of -> check.workers [assert.condition: var.count_of @12:38]",
+		},
+	})
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			modPath := t.TempDir()
@@ -404,5 +441,24 @@ func Test_graphTargetID(t *testing.T) {
 				t.Errorf("graphTargetID(%s, %t) = %q, %t; want %q, %t", tt.expr, tt.providerRef, got, ok, tt.want, tt.wantOk)
 			}
 		})
+	}
+}
+
+func Test_moduleGraphParseErrors(t *testing.T) {
+	modPath := t.TempDir()
+	src := []byte("resource \"terraform_data\" \"a\" {\n  oops = = 1\n")
+	_, diags := hclsyntax.ParseConfig(src, "main.tf", hcl.InitialPos)
+	if !diags.HasErrors() {
+		t.Fatal("test setup: expected a syntax error")
+	}
+	got := moduleGraphParseErrors(modPath, ast.ModDiags{"main.tf": diags, "ok.tf": nil})
+	if len(got) == 0 {
+		t.Fatal("no parse errors reported")
+	}
+	if got[0].URI != uri.FromPath(filepath.Join(modPath, "main.tf")) {
+		t.Errorf("unexpected URI %q", got[0].URI)
+	}
+	if moduleGraphParseErrors(modPath, ast.ModDiags{"ok.tf": nil}) != nil {
+		t.Error("a module without errors should report none")
 	}
 }

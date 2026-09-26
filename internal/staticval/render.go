@@ -44,8 +44,7 @@ func writeValue(b *strings.Builder, v cty.Value, indent string) {
 	switch {
 	case ty == cty.String:
 		s := v.AsString()
-		if strings.Contains(strings.TrimSuffix(s, "\n"), "\n") {
-			writeHeredoc(b, s, indent)
+		if strings.Contains(strings.TrimSuffix(s, "\n"), "\n") && writeHeredoc(b, s, indent) {
 			return
 		}
 		b.WriteString(quoteString(s))
@@ -134,15 +133,58 @@ func hasNested(v cty.Value) bool {
 	return false
 }
 
-func writeHeredoc(b *strings.Builder, s, indent string) {
-	b.WriteString("<<-EOT\n")
-	for _, line := range strings.Split(strings.TrimSuffix(s, "\n"), "\n") {
+// writeHeredoc renders a multi-line string as an indented heredoc when
+// one denotes exactly the same string, and reports whether it did. A
+// heredoc always ends with a newline, <<- strips the indentation that
+// its lines share, and a line holding only the delimiter ends it, so
+// strings that differ in any of these ways are left to quoteString.
+func writeHeredoc(b *strings.Builder, s, indent string) bool {
+	if !strings.HasSuffix(s, "\n") || strings.Contains(s, "\r") {
+		return false
+	}
+	lines := strings.Split(strings.TrimSuffix(s, "\n"), "\n")
+	flush := false
+	for _, line := range lines {
+		if line != "" && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			flush = true
+		}
+		if strings.HasPrefix(line, "\t") {
+			// tabs and the added spaces do not strip alike
+			return false
+		}
+	}
+	if !flush {
+		return false
+	}
+	delim := ""
+	for _, candidate := range []string{"EOT", "EOF", "END"} {
+		clash := false
+		for _, line := range lines {
+			if strings.TrimSpace(line) == candidate {
+				clash = true
+				break
+			}
+		}
+		if !clash {
+			delim = candidate
+			break
+		}
+	}
+	if delim == "" {
+		return false
+	}
+	b.WriteString("<<-" + delim + "\n")
+	for _, line := range lines {
 		if line != "" {
+			// a heredoc is a template: escape interpolation markers
+			line = strings.ReplaceAll(line, "${", "$${")
+			line = strings.ReplaceAll(line, "%{", "%%{")
 			b.WriteString(indent + "  " + line)
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString(indent + "EOT")
+	b.WriteString(indent + delim)
+	return true
 }
 
 // formatOneLine renders a value on a single line.

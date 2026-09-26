@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"sync"
 	"time"
 
 	"github.com/creachadair/jrpc2"
@@ -87,6 +88,14 @@ type service struct {
 	additionalHandlers rpch.Map
 
 	inlayHints settings.InlayHints
+	// inlayHintRefresh is set when the client accepts
+	// workspace/inlayHint/refresh.
+	inlayHintRefresh bool
+	inlayRefreshMu   sync.Mutex
+	inlayRefresh     *time.Timer
+
+	// workspace holds the workspace folders.
+	workspace workspaceDirs
 
 	singleFileMode bool
 }
@@ -614,6 +623,8 @@ func (svc *service) configureSessionDependencies(ctx context.Context, cfgOpts *s
 
 	cc, err := ilsp.ClientCapabilities(ctx)
 	if err == nil {
+		svc.inlayHintRefresh = cc.Workspace.InlayHint != nil && cc.Workspace.InlayHint.RefreshSupport
+
 		if _, ok := lsp.ExperimentalClientCapabilities(cc.Experimental).ShowReferencesCommandId(); ok {
 			moduleHooks = append(moduleHooks, refreshCodeLens(svc.server))
 		}

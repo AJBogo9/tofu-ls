@@ -76,6 +76,21 @@ func TestRanges(t *testing.T) {
 			[]string{"0-7", "1-3", "5-6"},
 		},
 		{
+			"a call closing after an object keeps its closing line visible",
+			`locals {
+  a = merge(var.x, {
+    k = 1
+  })
+  b = jsonencode({
+    k = [
+      1,
+    ]
+  })
+}
+`,
+			[]string{"0-8", "1-2", "4-7", "5-6"},
+		},
+		{
 			"one range per start line",
 			`locals {
   tags = merge({

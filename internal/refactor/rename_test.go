@@ -5,6 +5,7 @@ package refactor
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -177,6 +178,7 @@ func TestMovedBlock(t *testing.T) {
 	}{
 		{"file ending with a newline", "module \"app\" {}\n", "\nmoved {\n  from = module.app\n  to   = module.web\n}\n"},
 		{"file without a final newline", "module \"app\" {}", "\n\nmoved {\n  from = module.app\n  to   = module.web\n}\n"},
+		{"file with CRLF line endings", "module \"app\" {\r\n}\r\n", "\r\nmoved {\r\n  from = module.app\r\n  to   = module.web\r\n}\r\n"},
 	}
 	for i, tc := range testCases {
 		t.Run(fmt.Sprintf("%d-%s", i, tc.name), func(t *testing.T) {
@@ -190,5 +192,73 @@ func TestMovedBlock(t *testing.T) {
 				t.Fatal(diags)
 			}
 		})
+	}
+}
+
+func TestIsInstalledModule(t *testing.T) {
+	testCases := []struct {
+		dir  string
+		want bool
+	}{
+		{"/work/showcase", false},
+		{"/work/showcase/modules/app", false},
+		{"/work/showcase/.terraform/modules/remote", true},
+		{"/work/showcase/.terraform/modules/remote/modules/sub", true},
+		{"/work/showcase/terraform/modules/x", false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.dir, func(t *testing.T) {
+			if got := isInstalledModule(filepath.FromSlash(tc.dir)); got != tc.want {
+				t.Fatalf("isInstalledModule(%q) = %t, want %t", tc.dir, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestModuleOutputStepRange(t *testing.T) {
+	src := `locals {
+  a = module.app.port
+  b = module.app[0].port
+  c = module.app["k"].port
+  d = module.app[*].port
+  e = module.app[local.k].port
+  f = module.other.port
+  g = module.app.port_2
+  h = module.app
+}
+`
+	f, diags := hclsyntax.ParseConfig([]byte(src), "main.tf", hcl.InitialPos)
+	if diags.HasErrors() {
+		t.Fatal(diags)
+	}
+	got := make([]string, 0)
+	err := walkBodyTraversals(f.Body.(*hclsyntax.Body), "", false, func(tr hcl.Traversal, _ bool) error {
+		if rng, ok := moduleOutputStepRange(tr, "app", "port"); ok {
+			got = append(got, fmt.Sprintf("%d:%d-%d:%d", rng.Start.Line, rng.Start.Column, rng.End.Line, rng.End.Column))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{"2:18-2:22", "3:21-3:25", "4:23-4:27", "5:21-5:25", "6:27-6:31"}
+	if strings.Join(sorted(got), ",") != strings.Join(sorted(expected), ",") {
+		t.Fatalf("expected %v, got %v", expected, got)
+	}
+}
+
+func TestFileCache_syntaxErrorNamesTheFile(t *testing.T) {
+	root := filepath.FromSlash("/work/showcase")
+	fc := newFileCache(Env{ReadFile: func(path string) ([]byte, error) {
+		return []byte("resource \"x\" {\n"), nil
+	}})
+	fc.base = root
+	_, _, err := fc.body(filepath.Join(root, "modules", "app", "main.tf"))
+	if err == nil {
+		t.Fatal("expected a syntax error")
+	}
+	want := filepath.Join("modules", "app", "main.tf") + " has syntax errors; fix them before renaming"
+	if err.Error() != want {
+		t.Fatalf("expected %q, got %q", want, err.Error())
 	}
 }

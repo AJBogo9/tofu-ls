@@ -7,6 +7,7 @@ package handlers
 
 import (
 	"context"
+	"time"
 
 	lsctx "github.com/opentofu/tofu-ls/internal/context"
 	"github.com/opentofu/tofu-ls/internal/document"
@@ -62,5 +63,30 @@ func (svc *service) TextDocumentDidChange(ctx context.Context, params lsp.DidCha
 		LanguageID: string(ilsp.ParseLanguageID(doc.LanguageID)),
 	})
 
+	svc.scheduleInlayHintRefresh()
+
 	return nil
+}
+
+// inlayHintRefreshDelay batches the refreshes of a burst of edits.
+const inlayHintRefreshDelay = 300 * time.Millisecond
+
+// scheduleInlayHintRefresh asks the client to request inlay hints again
+// shortly after an edit. The value hints of one file depend on the other
+// files of its module, its tfvars and its callers, which the client does
+// not know about, so without a refresh a visible file keeps stale values.
+func (svc *service) scheduleInlayHintRefresh() {
+	if !svc.inlayHintRefresh || !svc.inlayHints.Values || svc.server == nil {
+		return
+	}
+	svc.inlayRefreshMu.Lock()
+	defer svc.inlayRefreshMu.Unlock()
+	if svc.inlayRefresh != nil {
+		svc.inlayRefresh.Stop()
+	}
+	svc.inlayRefresh = time.AfterFunc(inlayHintRefreshDelay, func() {
+		if _, err := svc.server.Callback(svc.sessCtx, "workspace/inlayHint/refresh", nil); err != nil {
+			svc.logger.Printf("refreshing inlay hints: %s", err)
+		}
+	})
 }
