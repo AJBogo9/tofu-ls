@@ -28,6 +28,9 @@ func updateDiagnostics(features *Features, dNotifier *diagnostics.Notifier) noti
 
 			diags.Extend(features.Modules.Diagnostics(path))
 			diags.Extend(features.Variables.Diagnostics(path))
+			if features.Tests != nil {
+				diags.Extend(features.Tests.Diagnostics(path))
+			}
 
 			dNotifier.PublishHCLDiags(ctx, path, diags)
 		}

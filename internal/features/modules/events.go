@@ -239,7 +239,39 @@ func (f *ModulesFeature) decodeDeclaredModuleCalls(ctx context.Context, dir docu
 	return jobIds, errs.ErrorOrNil()
 }
 
-func (f *ModulesFeature) decodeModule(ctx context.Context, dir document.DirHandle, ignoreState bool, isFirstLevel bool) (job.IDs, error) {
+// DecodeLocalModule indexes the module in modPath as a module call does,
+// e.g. for the test files whose runs run it. The walker only discovers
+// modules, and indexes none which no open module calls. A module indexed
+// already is left alone.
+func (f *ModulesFeature) DecodeLocalModule(ctx context.Context, modPath string) (job.IDs, error) {
+	if _, err := f.Store.LocalModuleMeta(modPath); err == nil {
+		return job.IDs{}, nil
+	}
+	fi, err := os.Stat(modPath)
+	if err != nil || !fi.IsDir() {
+		return job.IDs{}, err
+	}
+	err = f.Store.Add(modPath)
+	if err != nil {
+		alreadyExistsErr := &globalState.AlreadyExistsError{}
+		if !errors.As(err, &alreadyExistsErr) {
+			return job.IDs{}, err
+		}
+	}
+	dir := document.DirHandleFromPath(modPath)
+	// after the jobs queued for the module already, e.g. for an open file
+	// of it, which obtain its provider schemas before its references are
+	// decoded: decoding first would leave the references without them
+	pending, err := f.stateStore.JobStore.ListIncompleteJobsForDir(dir)
+	if err != nil {
+		return job.IDs{}, err
+	}
+	return f.decodeModule(ctx, dir, false, false, pending...)
+}
+
+// decodeModule schedules the jobs which index the module in dir, the
+// first one after the jobs in after.
+func (f *ModulesFeature) decodeModule(ctx context.Context, dir document.DirHandle, ignoreState bool, isFirstLevel bool, after ...job.ID) (job.IDs, error) {
 	ids := make(job.IDs, 0)
 	path := dir.Path()
 
@@ -257,6 +289,7 @@ func (f *ModulesFeature) decodeModule(ctx context.Context, dir document.DirHandl
 			return err
 		},
 		Type:        op.OpTypeParseModuleConfiguration.String(),
+		DependsOn:   after,
 		IgnoreState: ignoreState,
 	})
 	if err != nil {

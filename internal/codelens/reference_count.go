@@ -82,6 +82,11 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 				// resolved origins only: e.g. local.x does not count
 				// towards a provider named "local"
 				for _, po := range decoder.OriginsTargeting(ctx, pathReader, refTarget, path) {
+					if ilsp.IsValidTestLanguage(po.Path.LanguageID) {
+						// the lens counts the uses in configuration, as the
+						// unused hint does; Find References lists the tests too
+						continue
+					}
 					seen[originKey{path: po.Path, rng: po.Origin.OriginRange()}] = originKind(po, refTarget, path)
 				}
 			}

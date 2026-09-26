@@ -37,4 +37,7 @@ const (
 	OpTypeSchemaVarsValidation
 	OpTypeReferenceValidation
 	OpTypeTofuValidate
+	OpTypeParseTestFiles
+	OpTypeDecodeTestReferences
+	OpTypeSchemaTestValidation
 )
