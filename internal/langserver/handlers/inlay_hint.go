@@ -50,7 +50,7 @@ func (svc *service) TextDocumentInlayHint(ctx context.Context, params lsp.InlayH
 	if d, err := svc.decoderForDocument(ctx, doc); err == nil {
 		bodySchema = d.Schema()
 	}
-	ev, err := svc.staticEvaluator(doc.Dir.Path(), bodySchema)
+	ev, err := svc.staticEvaluator(ctx, doc.Dir.Path(), bodySchema)
 	if err != nil {
 		return nil, err
 	}

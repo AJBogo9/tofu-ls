@@ -4,6 +4,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -22,14 +23,14 @@ import (
 // staticEvaluator loads the module of dir for static evaluation. When
 // other indexed modules call dir through a local source, dir is a child
 // module: its variables get their values from those module calls, not
-// from tfvars files.
-func (svc *service) staticEvaluator(dir string, bodySchema *schema.BodySchema) (*staticval.Evaluator, error) {
+// from tfvars files. Evaluation stops once ctx is done.
+func (svc *service) staticEvaluator(ctx context.Context, dir string, bodySchema *schema.BodySchema) (*staticval.Evaluator, error) {
 	mod, err := staticval.LoadModule(svc.fs, dir)
 	if err != nil {
 		return nil, err
 	}
 	staticval.AddCallers(svc.fs, mod, maxCallerNesting, svc.indexedCallers)
-	ev := staticval.NewEvaluator(mod)
+	ev := staticval.NewEvaluatorContext(ctx, mod)
 	ev.SetEnv(svc.staticEnv(dir, bodySchema))
 	return ev, nil
 }
@@ -182,7 +183,7 @@ func attributeInfo(bodySchema *schema.BodySchema, blockType, typeName, attr stri
 
 // staticValueHover answers hovers on variables, locals, iteration symbols,
 // module calls and provider attributes with values and their sources.
-func (svc *service) staticValueHover(doc *document.Document, pos hcl.Pos, bodySchema *schema.BodySchema) (*lang.HoverData, bool) {
+func (svc *service) staticValueHover(ctx context.Context, doc *document.Document, pos hcl.Pos, bodySchema *schema.BodySchema) (*lang.HoverData, bool) {
 	langID := ilsp.ParseLanguageID(doc.LanguageID)
 	if langID != ilsp.OpenTofu && langID != ilsp.OpenTofuVars {
 		return nil, false
@@ -192,7 +193,7 @@ func (svc *service) staticValueHover(doc *document.Document, pos hcl.Pos, bodySc
 	var ok bool
 	if langID == ilsp.OpenTofuVars {
 		// The module's schema, not the tfvars one, describes resources.
-		ev, err := svc.staticEvaluator(dir, nil)
+		ev, err := svc.staticEvaluator(ctx, dir, nil)
 		if err != nil {
 			return nil, false
 		}
@@ -208,13 +209,13 @@ func (svc *service) staticValueHover(doc *document.Document, pos hcl.Pos, bodySc
 		if !staticval.WantsHover(f, pos) {
 			return nil, false
 		}
-		ev, err := svc.staticEvaluator(dir, bodySchema)
+		ev, err := svc.staticEvaluator(ctx, dir, bodySchema)
 		if err != nil {
 			return nil, false
 		}
 		h, ok = ev.HoverAt(doc.Filename, pos, svc.staticEnv(dir, bodySchema))
 	}
-	if !ok {
+	if !ok || ctx.Err() != nil {
 		return nil, false
 	}
 	return &lang.HoverData{

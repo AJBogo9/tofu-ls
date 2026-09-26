@@ -533,7 +533,7 @@ func TestWantsHover(t *testing.T) {
 		{"locals.tf", "prefix   =", 1, true},
 		{"locals.tf", "random_pet.p.id", 13, true},
 		{"locals.tf", "terraform.workspace", 12, true},
-		{"locals.tf", "path.module", 6, false},
+		{"locals.tf", "path.module", 6, true},
 		{"locals.tf", "format(", 2, false},
 		{"main.tf", `resource "random_pet"`, 2, false},
 		{"main.tf", `"random_pet"`, 3, false},
@@ -1111,12 +1111,12 @@ func TestValueBlock_capsLargeValues(t *testing.T) {
 
 func TestParseFile_cacheFollowsContent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "main.tf")
-	a := parseFile(path, []byte("locals {\n  a = 1\n}\n"))
-	again := parseFile(path, []byte("locals {\n  a = 1\n}\n"))
+	a, _ := parseFile(path, []byte("locals {\n  a = 1\n}\n"))
+	again, _ := parseFile(path, []byte("locals {\n  a = 1\n}\n"))
 	if a == nil || a != again {
 		t.Fatal("the same content should reuse the parsed file")
 	}
-	b := parseFile(path, []byte("locals {\n  a = 2\n}\n"))
+	b, _ := parseFile(path, []byte("locals {\n  a = 2\n}\n"))
 	if b == a {
 		t.Fatal("changed content must be parsed again")
 	}

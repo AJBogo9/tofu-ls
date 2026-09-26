@@ -70,15 +70,22 @@ func (ev *Evaluator) HoverAt(filename string, pos hcl.Pos, env Env) (*Hover, boo
 		return nil, false
 	}
 
+	// Blocks are as typed, so a label count or name may be wrong: every
+	// answer below needs the declaration the evaluator decoded.
 	for _, block := range body.Blocks {
 		if !block.Range().ContainsPos(pos) {
 			continue
 		}
 		if len(block.LabelRanges) > 0 && block.LabelRanges[0].ContainsPos(pos) {
+			if len(block.Labels) != 1 {
+				return nil, false
+			}
 			rng := block.LabelRanges[0]
 			switch block.Type {
 			case "variable":
-				return &Hover{Content: ev.variableHover(block.Labels[0], nil), Range: rng}, true
+				if content, ok := ev.variableHover(block.Labels[0], nil); ok {
+					return &Hover{Content: content, Range: rng}, true
+				}
 			case "module":
 				return &Hover{Content: ev.moduleCallHover(block, env), Range: rng}, true
 			case "output":
@@ -88,14 +95,17 @@ func (ev *Evaluator) HoverAt(filename string, pos hcl.Pos, env Env) (*Hover, boo
 			}
 			return nil, false
 		}
-		if block.Type == "locals" {
+		if block.Type == "locals" && len(block.Labels) == 0 {
 			for name, attr := range block.Body.Attributes {
 				if attr.NameRange.ContainsPos(pos) {
-					return &Hover{Content: ev.localHover(name, nil), Range: attr.NameRange}, true
+					if content, ok := ev.localHover(name, nil); ok {
+						return &Hover{Content: content, Range: attr.NameRange}, true
+					}
+					return nil, false
 				}
 			}
 		}
-		if block.Type == "module" {
+		if block.Type == "module" && len(block.Labels) == 1 {
 			if attr, ok := block.Body.Attributes["source"]; ok && attr.Expr.Range().ContainsPos(pos) {
 				return &Hover{Content: ev.moduleCallHover(block, env), Range: attr.Expr.Range()}, true
 			}
@@ -114,19 +124,21 @@ func (ev *Evaluator) HoverAt(filename string, pos hcl.Pos, env Env) (*Hover, boo
 		if !ok {
 			return nil, false
 		}
-		if _, ok := ev.vars[name]; !ok {
+		content, ok := ev.variableHover(name, expr)
+		if !ok {
 			return nil, false
 		}
-		return &Hover{Content: ev.variableHover(name, expr), Range: rng}, true
+		return &Hover{Content: content, Range: rng}, true
 	case "local":
 		name, ok := attrStep(t, 1)
 		if !ok {
 			return nil, false
 		}
-		if _, ok := ev.locals[name]; !ok {
+		content, ok := ev.localHover(name, expr)
+		if !ok {
 			return nil, false
 		}
-		return &Hover{Content: ev.localHover(name, expr), Range: rng}, true
+		return &Hover{Content: content, Range: rng}, true
 	case "each", "count":
 		content, ok := ev.iterationHover(body, expr)
 		if !ok {
@@ -144,7 +156,13 @@ func (ev *Evaluator) HoverAt(filename string, pos hcl.Pos, env Env) (*Hover, boo
 			return &Hover{Content: fmt.Sprintf("`terraform.workspace` _string_\n\n**Value** `%s`\n\nThe selected workspace (from `.terraform/environment`, else `default`). `TF_WORKSPACE` can select another one.", quoteString(ev.mod.Workspace)), Range: rng}, true
 		}
 		return nil, false
-	case "path", "self":
+	case "path":
+		content, ok := ev.pathHover(t)
+		if !ok {
+			return nil, false
+		}
+		return &Hover{Content: content, Range: rng}, true
+	case "self":
 		return nil, false
 	case "data":
 		if len(t) < 4 {
@@ -181,16 +199,16 @@ func WantsHover(f *hcl.File, pos hcl.Pos) bool {
 			continue
 		}
 		if len(block.LabelRanges) > 0 && block.LabelRanges[0].ContainsPos(pos) {
-			return block.Type == "variable" || block.Type == "module" || block.Type == "output"
+			return len(block.Labels) == 1 && (block.Type == "variable" || block.Type == "module" || block.Type == "output")
 		}
-		switch block.Type {
-		case "locals":
+		switch {
+		case block.Type == "locals" && len(block.Labels) == 0:
 			for _, attr := range block.Body.Attributes {
 				if attr.NameRange.ContainsPos(pos) {
 					return true
 				}
 			}
-		case "module":
+		case block.Type == "module" && len(block.Labels) == 1:
 			if attr, ok := block.Body.Attributes["source"]; ok && attr.Expr.Range().ContainsPos(pos) {
 				return true
 			}
@@ -201,13 +219,45 @@ func WantsHover(f *hcl.File, pos hcl.Pos) bool {
 		return false
 	}
 	switch expr.Traversal.RootName() {
-	case "path", "self":
+	case "path":
+		name, _ := attrStep(expr.Traversal, 1)
+		return name == "module" || name == "root" || name == "cwd"
+	case "self":
 		return false
 	case "terraform":
 		name, _ := attrStep(expr.Traversal, 1)
 		return name == "workspace"
 	}
 	return true
+}
+
+// pathHover shows path.module, path.root or path.cwd with the value
+// OpenTofu gives it when run in the root module: path.module and
+// path.root relative to that directory, path.cwd absolute.
+func (ev *Evaluator) pathHover(t hcl.Traversal) (string, bool) {
+	name, ok := attrStep(t, 1)
+	if !ok || len(t) != 2 {
+		return "", false
+	}
+	var doc string
+	switch name {
+	case "module":
+		doc = "The directory of the module where the expression is placed, relative to the working directory."
+	case "root":
+		doc = "The directory of the root module, relative to the working directory."
+	case "cwd":
+		doc = "The working directory OpenTofu runs in: the root module, unless `-chdir` or a wrapper runs it elsewhere."
+	default:
+		return "", false
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "`path.%s` _string_\n\n", name)
+	b.WriteString(valueBlock("**Value**", ev.pathValue().GetAttr(name), ""))
+	b.WriteString(doc)
+	if ev.mod.RootPath != "" {
+		fmt.Fprintf(&b, "\n\n_For the root module `%s`._", relPath(ev.mod.Path, ev.mod.RootPath))
+	}
+	return b.String(), true
 }
 
 // traversalAt returns the innermost scope traversal containing pos.
@@ -222,8 +272,11 @@ func traversalAt(body *hclsyntax.Body, pos hcl.Pos) *hclsyntax.ScopeTraversalExp
 	return found
 }
 
-func (ev *Evaluator) variableHover(name string, ref *hclsyntax.ScopeTraversalExpr) string {
-	v := ev.vars[name]
+func (ev *Evaluator) variableHover(name string, ref *hclsyntax.ScopeTraversalExpr) (string, bool) {
+	v, ok := ev.vars[name]
+	if !ok {
+		return "", false
+	}
 	var b strings.Builder
 
 	typeInline, typeBlock := typeDisplay(v)
@@ -251,6 +304,8 @@ func (ev *Evaluator) variableHover(name string, ref *hclsyntax.ScopeTraversalExp
 	switch {
 	case ev.mod.RootPath != "":
 		b.WriteString(ev.callValuesText(v))
+	case ev.refused.Kind == Rejected:
+		fmt.Fprintf(&b, "**Value** none: %s\n\n", ev.refused.Reason)
 	case !ok && len(v.Assignments) > 0 && v.Assignments[len(v.Assignments)-1].Err != "":
 		a := v.Assignments[len(v.Assignments)-1]
 		fmt.Fprintf(&b, "**Value** invalid: the value in `%s` does not match the type (%s)\n\n", a.File, a.Err)
@@ -261,9 +316,17 @@ func (ev *Evaluator) variableHover(name string, ref *hclsyntax.ScopeTraversalExp
 		if source != "default" {
 			from = "`" + source + "`"
 		}
-		if v.Sensitive {
-			fmt.Fprintf(&b, "**Value** %s from %s\n\n", sensitiveText, from)
-		} else {
+		switch failures := ev.failures[name]; {
+		case len(failures) > 0:
+			shown := "`" + FormatCompact(val, 60) + "`"
+			if v.redacted() {
+				shown = v.redactedText()
+			}
+			fmt.Fprintf(&b, "**Value** rejected: %s from %s fails %s, so OpenTofu refuses to plan:\n\n", shown, from, plural(len(failures), "a validation rule", "validation rules"))
+			b.WriteString(failureText(failures))
+		case v.redacted():
+			fmt.Fprintf(&b, "**Value** %s from %s\n\n", v.redactedText(), from)
+		default:
 			b.WriteString(valueBlock("**Value**", val, "from "+from))
 		}
 		if overridden := ev.overriddenSources(v, source); overridden != "" {
@@ -309,6 +372,29 @@ func (ev *Evaluator) variableHover(name string, ref *hclsyntax.ScopeTraversalExp
 		b.WriteString("\n\n")
 	}
 	fmt.Fprintf(&b, "_Declared in `%s`_", v.File)
+	return b.String(), true
+}
+
+// redactedText is what is shown instead of a value of v.
+func (v *Variable) redactedText() string {
+	if v.Ephemeral {
+		return ephemeralText
+	}
+	return sensitiveText
+}
+
+// failureText quotes the error messages of failed validation rules.
+func failureText(failures []ValidationFailure) string {
+	var b strings.Builder
+	for _, f := range failures {
+		msg := f.Message
+		if msg == "" {
+			msg = "(no error_message)"
+		}
+		b.WriteString("> ")
+		b.WriteString(strings.ReplaceAll(msg, "\n", "\n> "))
+		b.WriteString("\n\n")
+	}
 	return b.String()
 }
 
@@ -318,16 +404,19 @@ func (ev *Evaluator) callValuesText(v *Variable) string {
 	var b strings.Builder
 	if len(v.CallValues) == 0 {
 		b.WriteString("**Value** set by the module call")
-		if v.HasDefault && !v.Sensitive {
+		if v.HasDefault && !v.redacted() {
 			fmt.Fprintf(&b, " (default `%s`)", FormatCompact(v.Default, 40))
 		}
 		b.WriteString("\n\n")
 		return b.String()
 	}
 	if val, ok := v.callValue(); ok {
-		if v.Sensitive || val.ContainsMarked() {
-			fmt.Fprintf(&b, "**Value** %s", sensitiveText)
-		} else {
+		switch {
+		case v.redacted():
+			fmt.Fprintf(&b, "**Value** %s", v.redactedText())
+		case val.ContainsMarked():
+			fmt.Fprintf(&b, "**Value** %s", redactedText(val))
+		default:
 			b.WriteString(strings.TrimSuffix(valueBlock("**Value**", val, ""), "\n\n"))
 		}
 		if len(v.CallValues) > 1 {
@@ -340,14 +429,22 @@ func (ev *Evaluator) callValuesText(v *Variable) string {
 	for _, cv := range v.CallValues {
 		fmt.Fprintf(&b, "- `%s` (`%s`): ", cv.Call, cv.File)
 		switch {
+		case cv.NullReplaced && cv.Result.IsKnown():
+			if v.redacted() || cv.Result.IsSensitive() {
+				b.WriteString("default, since the call passes `null` and the variable is not nullable")
+			} else {
+				fmt.Fprintf(&b, "default `%s`, since the call passes `null` and the variable is not nullable", FormatCompact(cv.Result.Value, 50))
+			}
 		case !cv.Set && cv.Result.IsKnown():
-			if v.Sensitive {
+			if v.redacted() {
 				b.WriteString("default")
 			} else {
 				fmt.Fprintf(&b, "default `%s`", FormatCompact(cv.Result.Value, 50))
 			}
-		case cv.Result.IsKnown() && (v.Sensitive || cv.Result.IsSensitive()):
-			b.WriteString(sensitiveText)
+		case cv.Result.IsKnown() && v.redacted():
+			b.WriteString(v.redactedText())
+		case cv.Result.IsKnown() && cv.Result.IsSensitive():
+			b.WriteString(redactedText(cv.Result.Value))
 		case cv.Result.IsKnown():
 			fmt.Fprintf(&b, "`%s`", FormatCompact(cv.Result.Value, 50))
 		default:
@@ -369,14 +466,14 @@ func (ev *Evaluator) overriddenSources(v *Variable, winner string) string {
 		switch {
 		case a.Value.IsNull() && !v.Nullable && winner == "default":
 			parts = append(parts, fmt.Sprintf("`%s` sets `null`, which the default replaces because the variable is not nullable", a.File))
-		case v.Sensitive:
+		case v.redacted():
 			parts = append(parts, fmt.Sprintf("`%s`", a.File))
 		default:
 			parts = append(parts, fmt.Sprintf("`%s` sets `%s`", a.File, FormatCompact(a.Value, 40)))
 		}
 	}
 	if v.HasDefault && winner != "default" {
-		if v.Sensitive {
+		if v.redacted() {
 			parts = append(parts, "the default")
 		} else {
 			parts = append(parts, fmt.Sprintf("default `%s`", FormatCompact(v.Default, 40)))
@@ -404,13 +501,17 @@ func typeDisplay(v *Variable) (string, string) {
 	return "", dedent(src)
 }
 
-func (ev *Evaluator) localHover(name string, ref *hclsyntax.ScopeTraversalExpr) string {
-	l := ev.locals[name]
+func (ev *Evaluator) localHover(name string, ref *hclsyntax.ScopeTraversalExpr) (string, bool) {
+	l, ok := ev.locals[name]
+	if !ok {
+		return "", false
+	}
 	r := ev.EvalLocal(name)
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "`local.%s`", name)
-	if r.IsKnown() && !r.IsSensitive() {
+	sensitive := r.IsKnown() && r.IsSensitive()
+	if r.IsKnown() && !sensitive {
 		fmt.Fprintf(&b, " _%s_", r.Value.Type().FriendlyNameForConstraint())
 	}
 	b.WriteString("\n\n")
@@ -425,12 +526,14 @@ func (ev *Evaluator) localHover(name string, ref *hclsyntax.ScopeTraversalExpr) 
 			fmt.Fprintf(&b, "- `%s`: %s\n", pc.call, compactResult(pc.result, 50))
 		}
 		b.WriteString("\n")
+	} else if sensitive {
+		fmt.Fprintf(&b, "**Value** %s\n\n", redactedText(r.Value))
 	} else {
 		b.WriteString(resultBlock("**Value**", r))
 	}
 	fmt.Fprintf(&b, "```hcl\n%s = %s\n```\n\n", name, trimSource(l.Source))
 	fmt.Fprintf(&b, "_Defined in `%s`_", l.File)
-	return b.String()
+	return b.String(), true
 }
 
 // callResult is a result for one module call of a child module.
@@ -447,7 +550,7 @@ func (ev *Evaluator) perCall(fn func(child *Evaluator) Result) []callResult {
 	for _, c := range ev.mod.Callers {
 		parentEv, ok := parents[c.Parent]
 		if !ok {
-			parentEv = NewEvaluator(c.Parent)
+			parentEv = ev.newEvaluator(c.Parent)
 			if ev.host != nil {
 				parentEv.SetEnv(*ev.host)
 			}
@@ -469,7 +572,7 @@ func (ev *Evaluator) perCall(fn func(child *Evaluator) Result) []callResult {
 func compactResult(r Result, max int) string {
 	switch {
 	case r.IsKnown() && r.IsSensitive():
-		return sensitiveText
+		return redactedText(r.Value)
 	case r.IsKnown():
 		return "`" + FormatCompact(r.Value, max) + "`"
 	}
@@ -480,7 +583,7 @@ func compactResult(r Result, max int) string {
 func resultBlock(label string, r Result) string {
 	switch {
 	case r.IsKnown() && r.IsSensitive():
-		return label + " " + sensitiveText + "\n\n"
+		return label + " " + redactedText(r.Value) + "\n\n"
 	case r.IsKnown():
 		return valueBlock(label, r.Value, "")
 	}
@@ -509,6 +612,10 @@ func unknownExplanation(r Result) string {
 			return fmt.Sprintf("not evaluated: `%s` is not evaluated statically", r.Reason)
 		}
 		return "not evaluated: " + r.Reason
+	case Rejected:
+		return "error: " + r.Reason
+	case FromState:
+		return fmt.Sprintf("unknown: depends on `%s`, and lifecycle.ignore_changes keeps the value from state", r.Reason)
 	}
 	return "unknown"
 }
@@ -517,11 +624,11 @@ func unknownExplanation(r Result) string {
 func valueLine(ref string, r Result) string {
 	switch {
 	case r.IsKnown() && r.IsSensitive():
-		return fmt.Sprintf("`%s` = %s", ref, sensitiveText)
+		return fmt.Sprintf("`%s` = %s", ref, redactedText(r.Value))
 	case r.IsKnown():
-		s := FormatValue(r.Value)
+		s, cut := formatValueCapped(r.Value)
 		if strings.Contains(s, "\n") {
-			return fmt.Sprintf("`%s` =\n```hcl\n%s\n```", ref, capValueText(s))
+			return fmt.Sprintf("`%s` =\n```hcl\n%s\n```", ref, capValueText(s, cut))
 		}
 		return fmt.Sprintf("`%s` = `%s`", ref, truncate(s, maxValueChars))
 	}
@@ -531,15 +638,15 @@ func valueLine(ref string, r Result) string {
 // valueBlock renders a label and a value inline when it fits on one line,
 // or as an HCL code block.
 func valueBlock(label string, v cty.Value, suffix string) string {
-	s := FormatValue(v)
+	s, cut := formatValueCapped(v)
 	if suffix != "" {
 		suffix = " " + suffix
 	}
 	if pretty, ok := prettyJSON(v); ok {
-		return fmt.Sprintf("%s (a JSON string)%s\n```json\n%s\n```\n\n", label, suffix, capValueText(pretty))
+		return fmt.Sprintf("%s (a JSON string)%s\n```json\n%s\n```\n\n", label, suffix, capValueText(pretty, false))
 	}
 	if strings.Contains(s, "\n") {
-		return fmt.Sprintf("%s%s\n```hcl\n%s\n```\n\n", label, suffix, capValueText(s))
+		return fmt.Sprintf("%s%s\n```hcl\n%s\n```\n\n", label, suffix, capValueText(s, cut))
 	}
 	return fmt.Sprintf("%s `%s`%s\n\n", label, truncate(s, maxValueChars), suffix)
 }
@@ -552,9 +659,15 @@ const (
 )
 
 // capValueText keeps the first lines of a rendered value and says how
-// many are left out.
-func capValueText(s string) string {
+// many are left out. cutShort is true when the rendering itself stopped
+// early (see formatValueCapped): its last line is then partial, and the
+// lines after it were never counted.
+func capValueText(s string, cutShort bool) string {
 	lines := strings.Split(s, "\n")
+	if cutShort && len(lines) > 1 {
+		lines = lines[:len(lines)-1]
+	}
+	total := len(lines)
 	cut := 0
 	if len(lines) > maxValueLines {
 		cut = len(lines) - maxValueLines
@@ -566,9 +679,12 @@ func capValueText(s string) string {
 		if i := strings.LastIndex(out, "\n"); i > 0 {
 			out = out[:i]
 		}
-		cut = len(strings.Split(s, "\n")) - len(strings.Split(out, "\n"))
+		cut = total - len(strings.Split(out, "\n"))
 	}
-	if cut > 0 {
+	switch {
+	case cutShort:
+		out += "\n… the rest is not shown"
+	case cut > 0:
 		out += fmt.Sprintf("\n… %d more %s", cut, plural(cut, "line", "lines"))
 	}
 	return out
@@ -685,7 +801,10 @@ type Instance struct {
 func (ev *Evaluator) Instances(block *hclsyntax.Block) (string, Result, []Instance, bool) {
 	if attr, ok := block.Body.Attributes["for_each"]; ok {
 		r := ev.Eval(attr.Expr, nil)
-		if !r.IsKnown() || r.IsSensitive() || r.Value.IsNull() {
+		if r.IsKnown() && !r.IsSensitive() && r.Value.IsNull() {
+			return "for_each", Result{Value: cty.DynamicVal, Kind: Rejected, Reason: "OpenTofu rejects a null `for_each`: it needs a map or a set of strings"}, nil, true
+		}
+		if !r.IsKnown() || r.IsSensitive() {
 			return "for_each", r, nil, true
 		}
 		v := r.Value
@@ -704,6 +823,9 @@ func (ev *Evaluator) Instances(block *hclsyntax.Block) (string, Result, []Instan
 		case ty.IsSetType():
 			for it := v.ElementIterator(); it.Next(); {
 				_, e := it.Element()
+				if e.IsNull() {
+					return "for_each", Result{Value: cty.DynamicVal, Kind: Rejected, Reason: "OpenTofu rejects a `for_each` set that contains null"}, nil, true
+				}
 				insts = append(insts, Instance{Key: e, Value: e})
 			}
 		default:
@@ -718,7 +840,10 @@ func (ev *Evaluator) Instances(block *hclsyntax.Block) (string, Result, []Instan
 	}
 	if attr, ok := block.Body.Attributes["count"]; ok {
 		r := ev.Eval(attr.Expr, nil)
-		if !r.IsKnown() || r.IsSensitive() || r.Value.IsNull() {
+		if r.IsKnown() && !r.IsSensitive() && r.Value.IsNull() {
+			return "count", Result{Value: cty.DynamicVal, Kind: Rejected, Reason: "OpenTofu rejects a null `count`: it needs a whole number"}, nil, true
+		}
+		if !r.IsKnown() || r.IsSensitive() {
 			return "count", r, nil, true
 		}
 		n, err := convertInt(r.Value)
@@ -842,7 +967,7 @@ func (ev *Evaluator) iterationHover(body *hclsyntax.Body, expr *hclsyntax.ScopeT
 		val := "`" + FormatCompact(vr.Value, 60) + "`"
 		switch {
 		case vr.IsKnown() && vr.IsSensitive():
-			val = sensitiveText
+			val = redactedText(vr.Value)
 		case !vr.IsKnown():
 			val = unknownExplanation(vr)
 		}
@@ -975,11 +1100,16 @@ func (ev *Evaluator) configuredValue(blockType, typeName string, t hcl.Traversal
 	}
 	a, ok := block.Body.Attributes[attr]
 	if !ok {
-		if info.Optional && info.Computed {
+		switch {
+		case info.Optional && info.Computed:
 			return "**Value** not set in the configuration, so **known after apply**\n\n"
-		}
-		if info.Optional {
+		case info.Optional && blockType == "resource" && typeName == "terraform_data":
+			// built into OpenTofu, with no defaults
 			return "**Value** not set in the configuration (`null`)\n\n"
+		case info.Optional:
+			// Providers built on the legacy SDK plan defaults for arguments
+			// that their schema does not mark as computed.
+			return "**Value** not set in the configuration; the provider may set a default, so **known after apply**\n\n"
 		}
 		return ""
 	}
@@ -990,6 +1120,15 @@ func (ev *Evaluator) configuredValue(blockType, typeName string, t hcl.Traversal
 	r := ev.Eval(a.Expr, nil)
 	if info.Sensitive && r.IsKnown() {
 		r.Value = r.Value.Mark(SensitiveMark)
+	}
+	if blockType == "resource" && ignoresChanges(block, attr) {
+		// After the first apply the value comes from the state.
+		configured := "value"
+		if r.IsKnown() {
+			configured = "value " + compactResult(r, 60)
+		}
+		return resultBlock("**Value**", Result{Kind: FromState, Reason: TraversalString(t)}) +
+			fmt.Sprintf("Configured %s, which OpenTofu uses only when it creates the resource:\n```hcl\n%s = %s\n```\n\n", configured, attr, src)
 	}
 	return resultBlock("**Value**", r) + fmt.Sprintf("```hcl\n%s = %s\n```\n\n", attr, src)
 }
@@ -1040,7 +1179,7 @@ func (ev *Evaluator) resolveModuleCall(block *hclsyntax.Block, env Env) (*module
 		return mc, false
 	}
 	r := ev.Eval(attr.Expr, nil)
-	if !r.IsKnown() || r.Value.Type() != cty.String || r.Value.IsMarked() {
+	if !r.IsKnown() || r.Value.Type() != cty.String || r.Value.IsMarked() || r.Value.IsNull() {
 		return mc, false
 	}
 	mc.source = r.Value.AsString()
@@ -1075,7 +1214,7 @@ func (ev *Evaluator) childEvaluator(mc *moduleCall) *Evaluator {
 // childEvaluatorFor is childEvaluator for one instance of a call with
 // for_each or count, whose each or count values are given.
 func (ev *Evaluator) childEvaluatorFor(mc *moduleCall, each map[string]cty.Value) *Evaluator {
-	child := NewEvaluator(mc.child)
+	child := ev.newEvaluator(mc.child)
 	child.depth = ev.depth + 1
 	if ev.host != nil {
 		// Nested module calls evaluate their outputs too, up to
@@ -1084,6 +1223,7 @@ func (ev *Evaluator) childEvaluatorFor(mc *moduleCall, each map[string]cty.Value
 	}
 	for name, v := range child.vars {
 		cv := ev.callValueForInstance(mc.block, v, mc.child.Path, each)
+		child.validateCallValue(v, &cv)
 		v.CallValues = []CallValue{cv}
 		delete(child.varCauses, name)
 		val := cv.Result.Value
@@ -1091,11 +1231,9 @@ func (ev *Evaluator) childEvaluatorFor(mc *moduleCall, each map[string]cty.Value
 			val = cty.DynamicVal
 			child.varCauses[name] = cv.Result
 		}
-		if v.Sensitive {
-			val = val.Mark(SensitiveMark)
-		}
-		child.varValues[name] = val
+		child.varValues[name] = v.markValue(val)
 	}
+	child.applyValidations()
 	return child
 }
 
@@ -1104,8 +1242,20 @@ type outputDecl struct {
 	file        string
 	description string
 	sensitive   bool
+	ephemeral   bool
 	expr        hcl.Expression
 	source      string
+}
+
+// mark marks an output's value as sensitive or ephemeral, as declared.
+func (o *outputDecl) mark(val cty.Value) cty.Value {
+	if o.sensitive {
+		val = val.Mark(SensitiveMark)
+	}
+	if o.ephemeral {
+		val = val.Mark(EphemeralMark)
+	}
+	return val
 }
 
 func (m *Module) outputs() map[string]*outputDecl {
@@ -1131,8 +1281,13 @@ func (m *Module) outputs() map[string]*outputDecl {
 				}
 			}
 			if a, ok := attrs["sensitive"]; ok {
-				if v, diags := a.Expr.Value(nil); !diags.HasErrors() && v.Type() == cty.Bool && !v.IsNull() {
+				if v, diags := a.Expr.Value(nil); !diags.HasErrors() && v.Type() == cty.Bool && v.IsKnown() && !v.IsNull() {
 					o.sensitive = o.sensitive || v.True()
+				}
+			}
+			if a, ok := attrs["ephemeral"]; ok {
+				if v, diags := a.Expr.Value(nil); !diags.HasErrors() && v.Type() == cty.Bool && v.IsKnown() && !v.IsNull() {
+					o.ephemeral = o.ephemeral || v.True()
 				}
 			}
 			if a, ok := attrs["value"]; ok {
@@ -1200,8 +1355,8 @@ func (ev *Evaluator) moduleOutputHover(expr *hclsyntax.ScopeTraversalExpr, env E
 		default:
 			r = ev.childEvaluator(mc).Eval(out.expr, nil)
 		}
-		if out.sensitive && r.IsKnown() {
-			r.Value = r.Value.Mark(SensitiveMark)
+		if r.IsKnown() {
+			r.Value = out.mark(r.Value)
 		}
 		if len(t) > outStep+1 && r.IsKnown() {
 			// A deeper reference, such as module.x.out.attr.
@@ -1212,8 +1367,13 @@ func (ev *Evaluator) moduleOutputHover(expr *hclsyntax.ScopeTraversalExpr, env E
 		b.WriteString(resultBlock("**Value**", r))
 		fmt.Fprintf(&b, "```hcl\nvalue = %s\n```\n\n", trimSource(out.source))
 	}
-	if out.sensitive {
+	switch {
+	case out.sensitive && out.ephemeral:
+		b.WriteString("sensitive · ephemeral\n\n")
+	case out.sensitive:
 		b.WriteString("sensitive\n\n")
+	case out.ephemeral:
+		b.WriteString("ephemeral\n\n")
 	}
 	fmt.Fprintf(&b, "_Defined in `%s`_", relPath(ev.mod.Path, filepath.Join(mc.dir, out.file)))
 	return b.String(), true
@@ -1251,15 +1411,15 @@ func (ev *Evaluator) outputHover(name string) (string, bool) {
 	}
 	if out.expr != nil {
 		r := ev.Eval(out.expr, nil)
-		if out.sensitive && r.IsKnown() {
-			r.Value = r.Value.Mark(SensitiveMark)
+		if r.IsKnown() {
+			r.Value = out.mark(r.Value)
 		}
 		if r.Kind == PerCall && len(ev.mod.Callers) > 0 {
 			b.WriteString("**Value** by module call:\n\n")
 			for _, pc := range ev.perCall(func(child *Evaluator) Result {
 				cr := child.Eval(out.expr, nil)
-				if out.sensitive && cr.IsKnown() {
-					cr.Value = cr.Value.Mark(SensitiveMark)
+				if cr.IsKnown() {
+					cr.Value = out.mark(cr.Value)
 				}
 				return cr
 			}) {
@@ -1271,8 +1431,13 @@ func (ev *Evaluator) outputHover(name string) (string, bool) {
 		}
 		fmt.Fprintf(&b, "```hcl\nvalue = %s\n```\n\n", trimSource(out.source))
 	}
-	if out.sensitive {
+	switch {
+	case out.sensitive && out.ephemeral:
+		b.WriteString("sensitive · ephemeral\n\n")
+	case out.sensitive:
 		b.WriteString("sensitive\n\n")
+	case out.ephemeral:
+		b.WriteString("ephemeral\n\n")
 	}
 	return strings.TrimSpace(b.String()), true
 }
@@ -1300,7 +1465,7 @@ func (ev *Evaluator) moduleCallHover(block *hclsyntax.Block, env Env) string {
 	}
 	fmt.Fprintf(&b, "Directory `%s`\n\n", relPath(ev.mod.Path, mc.dir))
 
-	child := NewEvaluator(mc.child)
+	child := ev.newEvaluator(mc.child)
 	names := mapKeys(child.vars)
 	sort.SliceStable(names, func(i, j int) bool {
 		ri := !child.vars[names[i]].HasDefault
@@ -1325,18 +1490,25 @@ func (ev *Evaluator) moduleCallHover(block *hclsyntax.Block, env Env) string {
 			b.WriteString(" · required")
 		case set:
 			b.WriteString(" · optional")
-		case v.Sensitive:
-			b.WriteString(" · default " + sensitiveText)
+		case v.redacted():
+			b.WriteString(" · default " + v.redactedText())
 		default:
 			fmt.Fprintf(&b, " · default `%s`", FormatCompact(v.Default, 30))
 		}
 		if set {
 			cv := ev.callValueFor(block, v, mc.child.Path)
+			child.validateCallValue(v, &cv)
 			switch {
-			case cv.Result.IsKnown() && (v.Sensitive || cv.Result.IsSensitive()):
-				b.WriteString(" = " + sensitiveText)
+			case cv.Result.IsKnown() && v.redacted():
+				b.WriteString(" = " + v.redactedText())
+			case cv.Result.IsKnown() && cv.Result.IsSensitive():
+				b.WriteString(" = " + redactedText(cv.Result.Value))
+			case cv.Result.IsKnown() && cv.NullReplaced:
+				fmt.Fprintf(&b, " = `null`, so the default `%s`", FormatCompact(cv.Result.Value, 30))
 			case cv.Result.IsKnown():
 				fmt.Fprintf(&b, " = `%s`", FormatCompact(cv.Result.Value, 40))
+			case cv.Result.Kind == Rejected:
+				b.WriteString(" · **" + unknownExplanation(cv.Result) + "**")
 			}
 		}
 		if v.Description != "" {
@@ -1353,6 +1525,9 @@ func (ev *Evaluator) moduleCallHover(block *hclsyntax.Block, env Env) string {
 		fmt.Fprintf(&b, "- `%s`", name)
 		if o.sensitive {
 			b.WriteString(" · sensitive")
+		}
+		if o.ephemeral {
+			b.WriteString(" · ephemeral")
 		}
 		if o.description != "" {
 			fmt.Fprintf(&b, ": %s", firstSentence(o.description))

@@ -5,6 +5,7 @@ package staticval
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
@@ -46,8 +47,15 @@ func (ev *Evaluator) InlayHints(filename string, rng hcl.Range, maxLen int) []In
 	}
 
 	var hints []InlayHint
+	// A var or local reference has the same value wherever it is written,
+	// so each distinct one is evaluated and rendered once: a file may
+	// refer to one large value a thousand times.
+	labels := make(map[string]string)
 	visit := func(node hclsyntax.Node) {
 		hclsyntax.VisitAll(node, func(n hclsyntax.Node) hcl.Diagnostics {
+			if ev.cancelled() {
+				return nil
+			}
 			expr, ok := n.(*hclsyntax.ScopeTraversalExpr)
 			if !ok {
 				return nil
@@ -64,13 +72,20 @@ func (ev *Evaluator) InlayHints(filename string, rng hcl.Range, maxLen int) []In
 			if len(expr.Traversal) < 2 {
 				return nil
 			}
-			r := ev.Eval(expr, nil)
-			if !r.IsKnown() || r.IsSensitive() {
+			key := traversalKey(expr.Traversal)
+			label, seen := labels[key]
+			if !seen {
+				if r := ev.Eval(expr, nil); r.IsKnown() && !r.IsSensitive() {
+					label = "= " + FormatCompact(r.Value, maxLen)
+				}
+				labels[key] = label
+			}
+			if label == "" {
 				return nil
 			}
 			hints = append(hints, InlayHint{
 				Pos:   exprRng.End,
-				Label: "= " + FormatCompact(r.Value, maxLen),
+				Label: label,
 				Ref:   TraversalString(expr.Traversal),
 			})
 			return nil
@@ -101,10 +116,36 @@ func (ev *Evaluator) InlayHints(filename string, rng hcl.Range, maxLen int) []In
 		}
 		visit(block)
 	}
+	if ev.cancelled() {
+		return nil
+	}
 	sort.Slice(hints, func(i, j int) bool {
 		return hints[i].Pos.Byte < hints[j].Pos.Byte
 	})
 	return hints
+}
+
+// traversalKey identifies a traversal exactly, index keys included.
+func traversalKey(t hcl.Traversal) string {
+	var b strings.Builder
+	for _, step := range t {
+		switch s := step.(type) {
+		case hcl.TraverseRoot:
+			b.WriteString(s.Name)
+		case hcl.TraverseAttr:
+			b.WriteString(".")
+			b.WriteString(s.Name)
+		case hcl.TraverseIndex:
+			b.WriteString("[")
+			b.WriteString(s.Key.GoString())
+			b.WriteString("]")
+		case hcl.TraverseSplat:
+			b.WriteString("[*]")
+		default:
+			b.WriteString("?")
+		}
+	}
+	return b.String()
 }
 
 // isSensitiveArgument reports whether the provider schema marks an
