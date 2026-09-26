@@ -33,6 +33,9 @@ func updateDiagnostics(features *Features, dNotifier *diagnostics.Notifier, inpu
 				diags.Extend(features.Tests.Diagnostics(path))
 			}
 			extendVarFileDiags(features, inputs, path, diags)
+			if features.Terragrunt != nil {
+				diags.Extend(features.Terragrunt.Diagnostics(path))
+			}
 
 			dNotifier.PublishHCLDiags(ctx, path, diags)
 		}

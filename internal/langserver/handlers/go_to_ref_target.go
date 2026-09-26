@@ -69,5 +69,12 @@ func (svc *service) goToReferenceTarget(ctx context.Context, params lsp.TextDocu
 		LanguageID: string(ilsp.ParseLanguageID(doc.LanguageID)),
 	}
 
-	return svc.decoder.ReferenceTargetsForOriginAtPos(path, doc.Filename, pos)
+	targets, err := svc.decoder.ReferenceTargetsForOriginAtPos(path, doc.Filename, pos)
+	if (err != nil || len(targets) == 0) && ilsp.IsValidTerragruntLanguage(doc.LanguageID) {
+		// a path to another file, unless the position is on a reference
+		if target, ok := svc.terragruntLinkTarget(doc, pos); ok {
+			return decoder.ReferenceTargets{target}, nil
+		}
+	}
+	return targets, err
 }

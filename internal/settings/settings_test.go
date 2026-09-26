@@ -132,6 +132,7 @@ func TestDecodeOptions_validationFamilies(t *testing.T) {
 				UnusedDataSources:        true,
 				InterpolationOnly:        true,
 				Conditions:               true,
+				Terragrunt:               true,
 			},
 		},
 		{
@@ -142,6 +143,7 @@ func TestDecodeOptions_validationFamilies(t *testing.T) {
 					"operandTypes":             false,
 					"installation":             false,
 					"conditions":               false,
+					"terragrunt":               false,
 				},
 			},
 			ValidationOptions{
@@ -157,6 +159,7 @@ func TestDecodeOptions_validationFamilies(t *testing.T) {
 				UnusedDataSources:        true,
 				InterpolationOnly:        true,
 				Conditions:               false,
+				Terragrunt:               false,
 			},
 		},
 	}

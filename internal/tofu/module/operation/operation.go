@@ -41,4 +41,7 @@ const (
 	OpTypeParseTestFiles
 	OpTypeDecodeTestReferences
 	OpTypeSchemaTestValidation
+	OpTypeParseTerragruntFiles
+	OpTypeDecodeTerragruntReferences
+	OpTypeSchemaTerragruntValidation
 )

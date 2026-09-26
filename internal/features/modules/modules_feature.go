@@ -120,8 +120,9 @@ func (f *ModulesFeature) Start(ctx context.Context) {
 				didOpenDone <- struct{}{}
 			case didChange := <-didChange:
 				// TODO? collect errors
-				// an edit of a test file leaves the module as it is
-				if !lsp.IsValidTestLanguage(didChange.LanguageID) && !lsp.IsValidMockLanguage(didChange.LanguageID) {
+				// an edit of a test or Terragrunt file leaves the module as it is
+				if !lsp.IsValidTestLanguage(didChange.LanguageID) && !lsp.IsValidMockLanguage(didChange.LanguageID) &&
+					!lsp.IsValidTerragruntLanguage(didChange.LanguageID) {
 					f.didChange(didChange.Context, didChange.Dir)
 				}
 				didChangeDone <- struct{}{}

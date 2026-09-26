@@ -25,6 +25,7 @@ import (
 	"github.com/opentofu/tofu-ls/internal/eventbus"
 	fmodules "github.com/opentofu/tofu-ls/internal/features/modules"
 	frootmodules "github.com/opentofu/tofu-ls/internal/features/rootmodules"
+	fterragrunt "github.com/opentofu/tofu-ls/internal/features/terragrunt"
 	ftests "github.com/opentofu/tofu-ls/internal/features/tests"
 	fvariables "github.com/opentofu/tofu-ls/internal/features/variables"
 	"github.com/opentofu/tofu-ls/internal/filesystem"
@@ -54,6 +55,7 @@ type Features struct {
 	RootModules *frootmodules.RootModulesFeature
 	Variables   *fvariables.VariablesFeature
 	Tests       *ftests.TestsFeature
+	Terragrunt  *fterragrunt.TerragruntFeature
 }
 
 type service struct {
@@ -636,11 +638,19 @@ func (svc *service) configureSessionDependencies(ctx context.Context, cfgOpts *s
 		testsFeature.SetLogger(svc.logger)
 		testsFeature.Start(svc.sessCtx)
 
+		terragruntFeature, err := fterragrunt.NewTerragruntFeature(svc.eventBus, svc.stateStore, svc.fs)
+		if err != nil {
+			return err
+		}
+		terragruntFeature.SetLogger(svc.logger)
+		terragruntFeature.Start(svc.sessCtx)
+
 		svc.features = &Features{
 			Modules:     modulesFeature,
 			RootModules: rootModulesFeature,
 			Variables:   variablesFeature,
 			Tests:       testsFeature,
+			Terragrunt:  terragruntFeature,
 		}
 	}
 
@@ -651,6 +661,10 @@ func (svc *service) configureSessionDependencies(ctx context.Context, cfgOpts *s
 	if svc.features.Tests != nil {
 		pathReaders[ilsp.OpenTofuTest.String()] = svc.features.Tests
 		pathReaders[ilsp.OpenTofuMock.String()] = svc.features.Tests
+	}
+	if svc.features.Terragrunt != nil {
+		pathReaders[ilsp.Terragrunt.String()] = svc.features.Terragrunt
+		pathReaders[ilsp.TerragruntStack.String()] = svc.features.Terragrunt
 	}
 	svc.pathReader = &idecoder.GlobalPathReader{
 		PathReaderMap: pathReaders,
@@ -738,6 +752,9 @@ func (svc *service) shutdown() {
 		}
 		if svc.features.Tests != nil {
 			svc.features.Tests.Stop()
+		}
+		if svc.features.Terragrunt != nil {
+			svc.features.Terragrunt.Stop()
 		}
 	}
 }

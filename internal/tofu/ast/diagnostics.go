@@ -24,9 +24,14 @@ const (
 	SemanticValidationSource
 	// FilePathsSource reports file function paths that name no file.
 	FilePathsSource
+	// TerragruntSource reports the diagnostics of Terragrunt files.
+	TerragruntSource
 )
 
 func (d DiagnosticSource) String() string {
+	if d == TerragruntSource {
+		return "Terragrunt"
+	}
 	return "OpenTofu"
 }
 

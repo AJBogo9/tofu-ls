@@ -27,7 +27,10 @@ func (svc *service) References(ctx context.Context, params lsp.ReferenceParams) 
 		return nil, err
 	}
 	svc.stateStore.JobStore.WaitForJobs(ctx, jobIds...)
-	svc.decodeWorkspaceModules(ctx)
+	if !ilsp.IsValidTerragruntLanguage(doc.LanguageID) {
+		// uses of a Terragrunt file's names are in the file itself
+		svc.decodeWorkspaceModules(ctx)
+	}
 
 	pos, err := ilsp.HCLPositionFromLspPosition(params.TextDocumentPositionParams.Position, doc)
 	if err != nil {

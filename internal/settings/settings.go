@@ -59,6 +59,9 @@ type ValidationOptions struct {
 	// rules, and preconditions, postconditions and check assertions that
 	// fail, when every value they need is known without a plan.
 	Conditions bool `mapstructure:"conditions" default:"true"`
+	// Terragrunt reports blocks and attributes of Terragrunt files which
+	// Terragrunt's configuration reference does not have, as warnings.
+	Terragrunt bool `mapstructure:"terragrunt" default:"true"`
 
 	// UnusedSymbols is copied from DiagnosticsOptions, so that it
 	// reaches the module jobs together with the validation options.
