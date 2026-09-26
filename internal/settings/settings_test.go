@@ -109,3 +109,67 @@ func TestValidate_relativePath(t *testing.T) {
 		t.Fatal("expected decoding of relative path to result in error")
 	}
 }
+
+func TestDecodeOptions_validationFamilies(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    map[string]interface{}
+		expected ValidationOptions
+	}{
+		{
+			"every family is on by default",
+			map[string]interface{}{},
+			ValidationOptions{
+				EnableEnhancedValidation: true,
+				DuplicateDeclarations:    true,
+				UnresolvedReferences:     true,
+				UnknownResourceTypes:     true,
+				VariableTypes:            true,
+				Tfvars:                   true,
+				StaticValues:             true,
+				OperandTypes:             true,
+				Installation:             true,
+				UnusedDataSources:        true,
+				InterpolationOnly:        true,
+			},
+		},
+		{
+			"families switched off one by one",
+			map[string]interface{}{
+				"validation": map[string]interface{}{
+					"enableEnhancedValidation": true,
+					"operandTypes":             false,
+					"installation":             false,
+				},
+			},
+			ValidationOptions{
+				EnableEnhancedValidation: true,
+				DuplicateDeclarations:    true,
+				UnresolvedReferences:     true,
+				UnknownResourceTypes:     true,
+				VariableTypes:            true,
+				Tfvars:                   true,
+				StaticValues:             true,
+				OperandTypes:             false,
+				Installation:             false,
+				UnusedDataSources:        true,
+				InterpolationOnly:        true,
+			},
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(fmt.Sprintf("%d-%s", i, tc.name), func(t *testing.T) {
+			out, err := DecodeOptions(tc.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(out.UnusedKeys) > 0 {
+				t.Fatalf("unexpected unused keys: %q", out.UnusedKeys)
+			}
+			if diff := cmp.Diff(tc.expected, out.Options.Validation); diff != "" {
+				t.Fatalf("options mismatch: %s", diff)
+			}
+		})
+	}
+}

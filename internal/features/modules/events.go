@@ -357,13 +357,32 @@ func (f *ModulesFeature) decodeModule(ctx context.Context, dir document.DirHandl
 					return deferIds, err
 				}
 
+				if validationOptions.UnresolvedReferences {
+					_, err = f.stateStore.JobStore.EnqueueJob(ctx, job.Job{
+						Dir: dir,
+						Func: func(ctx context.Context) error {
+							return jobs.ReferenceValidation(ctx, f.Store, f.rootFeature, dir.Path())
+						},
+						Type:        op.OpTypeReferenceValidation.String(),
+						DependsOn:   job.IDs{refOriginsId, refTargetsId},
+						IgnoreState: ignoreState,
+					})
+					if err != nil {
+						return deferIds, err
+					}
+				}
+
+				// needs the metadata of the called modules (for their
+				// outputs) and the embedded provider schemas
+				semanticDeps := append(job.IDs{eSchemaId}, modCalls...)
 				_, err = f.stateStore.JobStore.EnqueueJob(ctx, job.Job{
 					Dir: dir,
 					Func: func(ctx context.Context) error {
-						return jobs.ReferenceValidation(ctx, f.Store, f.rootFeature, dir.Path())
+						return jobs.SemanticValidation(ctx, f.fs, f.Store, f.rootFeature,
+							f.stateStore.ProviderSchemas, dir.Path(), validationOptions)
 					},
-					Type:        op.OpTypeReferenceValidation.String(),
-					DependsOn:   job.IDs{refOriginsId, refTargetsId},
+					Type:        op.OpTypeSemanticValidation.String(),
+					DependsOn:   semanticDeps,
 					IgnoreState: ignoreState,
 				})
 				if err != nil {
