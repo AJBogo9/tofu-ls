@@ -240,8 +240,8 @@ func TestValuesInputs(t *testing.T) {
 				"jsonrpc": "2.0",
 				"id": %d,
 				"result": [
-					{"position": {"line": 7, "character": 25}, "label": [{"value": "= \"%s\""}], "paddingLeft": true},
-					{"position": {"line": 11, "character": 20}, "label": [{"value": "= \"app-%s\""}], "paddingLeft": true}
+					{"position": {"line": 7, "character": 27}, "label": [{"value": "▸ \"app-%s\""}], "paddingLeft": true},
+					{"position": {"line": 11, "character": 20}, "label": [{"value": "▸ \"app-%s\""}], "paddingLeft": true}
 				]
 			}`, id, stage, stage))
 	}
