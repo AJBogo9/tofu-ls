@@ -40,12 +40,21 @@ type Module struct {
 	Files map[string]*hcl.File
 
 	// VarsFiles maps the base name of each tfvars file that OpenTofu loads
-	// automatically to its parsed content.
+	// automatically to its parsed content, and each file of VarFiles to
+	// its content under the same name.
 	VarsFiles map[string]*hcl.File
 
-	// VarsFileErrors maps the base name of each of those tfvars files that
-	// has a syntax error to its first error. OpenTofu refuses to run then.
+	// VarsFileErrors maps the name of each of those tfvars files that has
+	// a syntax error, or that does not exist, to its first error. OpenTofu
+	// refuses to run then.
 	VarsFileErrors map[string]string
+
+	// VarFiles are the files given with -var-file, relative to Path and
+	// slash-separated, in the order given (see Inputs).
+	VarFiles []string
+
+	// EnvVars are the TF_VAR_ environment variables by variable name.
+	EnvVars map[string]string
 
 	// Workspace is the selected workspace, "default" when none is known.
 	Workspace string
@@ -191,7 +200,84 @@ func LoadModule(fsys FS, dir string) (*Module, error) {
 		}
 	}
 
+	if in, ok := fsys.(inputsFS); ok {
+		mod.applyInputs(fsys, in.src.Inputs(dir))
+	}
+
 	return mod, nil
+}
+
+// applyInputs reads the -var-file files of in and keeps its environment
+// variables. A file that cannot be read is an error, as in OpenTofu.
+func (m *Module) applyInputs(fsys FS, in Inputs) {
+	for _, f := range in.VarFiles {
+		name, ok := CleanVarFile(f)
+		if !ok {
+			continue
+		}
+		m.VarFiles = append(m.VarFiles, name)
+		if _, loaded := m.VarsFiles[name]; loaded {
+			// an automatically loaded file given again with -var-file
+			continue
+		}
+		src, err := fsys.ReadFile(filepath.Join(m.Path, filepath.FromSlash(name)))
+		if err != nil {
+			m.VarsFileErrors[name] = "the file does not exist or cannot be read"
+			continue
+		}
+		file, diags := parseFile(filepath.Join(m.Path, filepath.FromSlash(name)), src)
+		if file == nil {
+			m.VarsFileErrors[name] = diagLine(diags)
+			continue
+		}
+		m.VarsFiles[name] = file
+		if diags.HasErrors() {
+			m.VarsFileErrors[name] = diagLine(diags)
+		}
+	}
+	m.EnvVars = in.EnvVars
+}
+
+// RunAsRoot reports whether a root module shows that OpenTofu runs it as
+// it is: it has an automatically loaded tfvars file, -var-file files are
+// chosen for it, or it configures a backend. A directory without any of
+// these may be a library module (initialized for its examples or tests)
+// whose callers set what its defaults leave open.
+func (m *Module) RunAsRoot() bool {
+	for name := range m.VarsFiles {
+		if IsAutoVarsFile(name) && !strings.Contains(name, "/") {
+			return true
+		}
+	}
+	if len(m.VarFiles) > 0 {
+		return true
+	}
+	for _, f := range m.Files {
+		content, _, _ := f.Body.PartialContent(&hcl.BodySchema{Blocks: []hcl.BlockHeaderSchema{{Type: "terraform"}}})
+		if content == nil {
+			continue
+		}
+		for _, tb := range content.Blocks {
+			inner, _, _ := tb.Body.PartialContent(&hcl.BodySchema{Blocks: []hcl.BlockHeaderSchema{
+				{Type: "backend", LabelNames: []string{"type"}},
+				{Type: "cloud"},
+			}})
+			if inner != nil && len(inner.Blocks) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// IsVarFile reports whether name is one of the module's -var-file files.
+func (m *Module) IsVarFile(name string) bool {
+	for _, f := range m.VarFiles {
+		if f == name {
+			return true
+		}
+	}
+	return false
 }
 
 // parsedFiles caches the parsed files by path: every hover and inlay

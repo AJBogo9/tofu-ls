@@ -198,3 +198,72 @@ func TestHover_variableValue(t *testing.T) {
 			}
 		}`, content))
 }
+
+// TestValuesInputs chooses a -var-file with tofu-ls.values.inputs: the
+// hints and hovers show its values, named as the selected environment,
+// until the choice is cleared.
+func TestValuesInputs(t *testing.T) {
+	ls, tmpDir, stop := startStaticValuesServer(t, `{}`)
+	defer stop()
+	if err := os.MkdirAll(filepath.Join(tmpDir.Path(), "envs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir.Path(), "envs", "qa.tfvars"), []byte("stage = \"qa\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	choose := func(id int, varFiles string) {
+		arg, err := json.Marshal("varFiles=" + varFiles)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ls.CallAndExpectResponse(t, &langserver.CallRequest{
+			Method:    "workspace/executeCommand",
+			ReqParams: fmt.Sprintf(`{"command": "tofu-ls.values.inputs", "arguments": [%s]}`, arg),
+		}, fmt.Sprintf(`{"jsonrpc": "2.0", "id": %d, "result": null}`, id))
+	}
+	hints := func(id int, stage string) {
+		ls.CallAndExpectResponse(t, &langserver.CallRequest{
+			Method: "textDocument/inlayHint",
+			ReqParams: fmt.Sprintf(`{
+				"textDocument": {"uri": "%s/main.tf"},
+				"range": {"start": {"line": 0, "character": 0}, "end": {"line": 13, "character": 0}}
+			}`, tmpDir.URI)}, fmt.Sprintf(`{
+				"jsonrpc": "2.0",
+				"id": %d,
+				"result": [
+					{"position": {"line": 7, "character": 25}, "label": [{"value": "= \"%s\""}], "paddingLeft": true},
+					{"position": {"line": 11, "character": 20}, "label": [{"value": "= \"app-%s\""}], "paddingLeft": true}
+				]
+			}`, id, stage, stage))
+	}
+
+	choose(3, fmt.Sprintf(`{%q: ["envs/qa.tfvars"]}`, tmpDir.URI))
+	hints(4, "qa")
+
+	content, err := json.Marshal("`var.stage` _string_\n\n" +
+		"Deployment stage.\n\n" +
+		"**Value** `\"qa\"` from `envs/qa.tfvars` (selected environment)\n\n" +
+		"Overrides: `terraform.tfvars` sets `\"prod\"`; default `\"dev\"`\n\n" +
+		"_May be overridden by `-var` or `-var-file`._\n\n" +
+		"_Declared in `main.tf`_")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/hover",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": {"line": 7, "character": 20}
+		}`, tmpDir.URI)}, fmt.Sprintf(`{
+			"jsonrpc": "2.0",
+			"id": 5,
+			"result": {
+				"contents": {"kind": "markdown", "value": %s},
+				"range": {"start": {"line": 7, "character": 16}, "end": {"line": 7, "character": 25}}
+			}
+		}`, content))
+
+	choose(6, `{}`)
+	hints(7, "prod")
+}

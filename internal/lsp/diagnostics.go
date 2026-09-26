@@ -127,4 +127,6 @@ const (
 	CodeUnusedDataSource         = "unused-data-source"
 	CodeInterpolationOnly        = "interpolation-only"
 	CodeTemplateFileMissing      = "template-file-missing"
+	CodeValidationFailed         = "validation-failed"
+	CodeConditionFailed          = "condition-failed"
 )

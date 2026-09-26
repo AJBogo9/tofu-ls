@@ -25,6 +25,7 @@ import (
 	tfaddr "github.com/opentofu/registry-address"
 	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 	"github.com/opentofu/tofu-ls/internal/settings"
+	"github.com/opentofu/tofu-ls/internal/staticval"
 	"github.com/opentofu/tofu-ls/internal/uri"
 )
 
@@ -72,6 +73,14 @@ type Module struct {
 	Schema SchemaReader
 
 	FS FS
+
+	// Values evaluates the module's values without a plan, with the
+	// inputs chosen for it and its callers (see package staticval). The
+	// condition checks are skipped without it.
+	Values *staticval.Evaluator
+	// ValuesEnv resolves and loads the modules that the module calls, so
+	// that their validation rules check the arguments.
+	ValuesEnv staticval.Env
 }
 
 // Run runs the checks enabled in opts and returns their diagnostics by
@@ -108,6 +117,9 @@ func Run(mod *Module, opts settings.ValidationOptions) map[string]hcl.Diagnostic
 	}
 	if opts.InterpolationOnly {
 		c.interpolationOnly()
+	}
+	if opts.Conditions {
+		c.conditions()
 	}
 
 	return c.diags

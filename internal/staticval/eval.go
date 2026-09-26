@@ -120,6 +120,8 @@ type Variable struct {
 	HasDefault    bool
 	Default       cty.Value
 	DefaultSource string
+	// DefaultRange is the default's expression.
+	DefaultRange hcl.Range
 
 	Sensitive   bool
 	Nullable    bool
@@ -129,8 +131,8 @@ type Variable struct {
 	// Rules are the validation blocks.
 	Rules []ValidationRule
 
-	// Assignments are the tfvars values in the order OpenTofu applies
-	// them; the last one wins.
+	// Assignments are the TF_VAR_ and tfvars values in the order OpenTofu
+	// applies them; the last one wins.
 	Assignments []Assignment
 
 	// CallValues are the values the module calls pass, for a child module.
@@ -164,15 +166,38 @@ type ValidationRule struct {
 // ValidationFailure is a validation rule that a value fails.
 type ValidationFailure struct {
 	Range hcl.Range
-	// Message is the rule's error_message, rendered when it can be.
+	// Message is the rule's error_message, rendered when it can be, or
+	// the error the condition fails with when Err is set.
 	Message string
+	// Err is set when the condition fails with an error for the value,
+	// for example a function error, which OpenTofu reports as well.
+	Err bool
 }
 
-// Assignment is a value given to a variable in a tfvars file.
+// AssignmentKind says where an assignment comes from.
+type AssignmentKind int
+
+const (
+	// FromAutoFile is a tfvars file that OpenTofu loads automatically.
+	FromAutoFile AssignmentKind = iota
+	// FromVarFile is a file given with -var-file.
+	FromVarFile
+	// FromEnvironment is a TF_VAR_ environment variable.
+	FromEnvironment
+)
+
+// Assignment is a value given to a variable in a tfvars file, or in a
+// TF_VAR_ environment variable.
 type Assignment struct {
+	// File is the tfvars file name, or the environment variable's name
+	// (TF_VAR_<name>).
 	File  string
+	Kind  AssignmentKind
 	Range hcl.Range
-	Value cty.Value
+	// ValueRange is the value's expression; empty for an environment
+	// variable.
+	ValueRange hcl.Range
+	Value      cty.Value
 	// Err is set when the value does not convert to the variable's type.
 	Err string
 }
@@ -226,6 +251,9 @@ type Evaluator struct {
 	refused Result
 	// failures holds the validation rules that each variable's value fails.
 	failures map[string][]ValidationFailure
+	// strict leaves the variables of a root module unknown unless the
+	// module shows it is run as root (NewDiagnosticsEvaluatorContext).
+	strict bool
 }
 
 // maxModuleDepth caps how deep module outputs are evaluated through
@@ -246,6 +274,20 @@ func NewEvaluator(mod *Module) *Evaluator {
 // NewEvaluatorContext is NewEvaluator for a request: once ctx is done,
 // evaluations stop and return NotEvaluated.
 func NewEvaluatorContext(ctx context.Context, mod *Module) *Evaluator {
+	return newEvaluatorContext(ctx, mod, false)
+}
+
+// NewDiagnosticsEvaluatorContext is NewEvaluatorContext for diagnostics,
+// which must be certain. The defaults of a root module count only when
+// the module shows it is run as it is (see Module.RunAsRoot); otherwise
+// it may be a library module whose callers are not known, and its
+// variables are unknown. The modules it loads to evaluate (callers) are
+// treated alike.
+func NewDiagnosticsEvaluatorContext(ctx context.Context, mod *Module) *Evaluator {
+	return newEvaluatorContext(ctx, mod, true)
+}
+
+func newEvaluatorContext(ctx context.Context, mod *Module, strict bool) *Evaluator {
 	// OpenTofu resolves relative file paths against the working
 	// directory, which is the root module, and path.module is relative to
 	// it. Files may be read from the root's tree and the module's own.
@@ -270,6 +312,7 @@ func NewEvaluatorContext(ctx context.Context, mod *Module) *Evaluator {
 
 		moduleOutputs:   make(map[string]map[string]Result),
 		moduleInstances: make(map[string]cty.Value),
+		strict:          strict,
 	}
 	ev.decode()
 	return ev
@@ -277,7 +320,7 @@ func NewEvaluatorContext(ctx context.Context, mod *Module) *Evaluator {
 
 // newEvaluator is NewEvaluator for another module of the same request.
 func (ev *Evaluator) newEvaluator(mod *Module) *Evaluator {
-	return NewEvaluatorContext(ev.ctx, mod)
+	return newEvaluatorContext(ev.ctx, mod, ev.strict)
 }
 
 // cancelled reports whether the request that the evaluator serves is done.
@@ -350,18 +393,34 @@ func (ev *Evaluator) decode() {
 		}
 	}
 
-	names := mapKeys(ev.mod.VarsFiles)
+	// Only the directory's own files are loaded automatically; -var-file
+	// files follow them, in the order given.
+	var names []string
+	for _, name := range mapKeys(ev.mod.VarsFiles) {
+		if !strings.Contains(name, "/") {
+			names = append(names, name)
+		}
+	}
 	for name := range ev.mod.VarsFileErrors {
-		if _, ok := ev.mod.VarsFiles[name]; !ok {
+		if _, ok := ev.mod.VarsFiles[name]; !ok && !strings.Contains(name, "/") {
 			names = append(names, name)
 		}
 	}
 	varsFiles := VarsFileOrder(names)
+	autoCount := len(varsFiles)
+	varsFiles = append(varsFiles, ev.mod.VarFiles...)
 	if ev.mod.RootPath != "" {
-		// OpenTofu reads tfvars files only for the root module.
+		// OpenTofu reads tfvars files and TF_VAR_ variables only for the
+		// root module.
 		varsFiles = nil
+	} else {
+		ev.decodeEnvVars()
 	}
-	for _, name := range varsFiles {
+	for i, name := range varsFiles {
+		kind := FromAutoFile
+		if i >= autoCount {
+			kind = FromVarFile
+		}
 		if msg := ev.mod.VarsFileErrors[name]; msg != "" {
 			ev.refuse(name, msg)
 		}
@@ -387,7 +446,7 @@ func (ev *Evaluator) decode() {
 			if !ok {
 				continue
 			}
-			a := Assignment{File: name, Range: attr.Range, Value: val}
+			a := Assignment{File: name, Kind: kind, Range: attr.Range, ValueRange: attr.Expr.Range(), Value: val}
 			if _, err := v.convert(val); err != nil {
 				a.Err = err.Error()
 			}
@@ -422,6 +481,9 @@ func (ev *Evaluator) decode() {
 		if ev.mod.RootPath == "" && ev.refused.Kind == Rejected {
 			val = cty.DynamicVal
 			ev.varCauses[name] = ev.refused
+		} else if ev.mod.RootPath == "" && ev.strict && !ev.mod.RunAsRoot() {
+			val = cty.DynamicVal
+			ev.varCauses[name] = Result{Kind: NoInput, Reason: "var." + name}
 		}
 		if ev.mod.RootPath != "" {
 			// A child module gets its values from the module calls.
@@ -437,6 +499,39 @@ func (ev *Evaluator) decode() {
 		ev.varValues[name] = v.markValue(val)
 	}
 	ev.applyValidations()
+}
+
+// decodeEnvVars gives each declared variable the value of its TF_VAR_
+// environment variable, which every tfvars file overrides. OpenTofu takes
+// the value of a variable with a primitive type, or without a type, as a
+// literal string, and parses any other as an HCL expression.
+func (ev *Evaluator) decodeEnvVars() {
+	for _, name := range mapKeys(ev.mod.EnvVars) {
+		v, ok := ev.vars[name]
+		if !ok {
+			// OpenTofu ignores environment variables for undeclared
+			// variables
+			continue
+		}
+		raw := ev.mod.EnvVars[name]
+		envName := "TF_VAR_" + name
+		val := cty.StringVal(raw)
+		if v.TypeSource != "" && !v.Type.IsPrimitiveType() {
+			expr, diags := hclsyntax.ParseExpression([]byte(raw), envName, hcl.InitialPos)
+			if !diags.HasErrors() {
+				val, diags = expr.Value(nil)
+			}
+			if diags.HasErrors() {
+				ev.refuse(envName, diagSummary(diags))
+				continue
+			}
+		}
+		a := Assignment{File: envName, Kind: FromEnvironment, Range: v.DeclRange, Value: val}
+		if _, err := v.convert(val); err != nil {
+			a.Err = err.Error()
+		}
+		v.Assignments = append(v.Assignments, a)
+	}
 }
 
 // refuse records that OpenTofu refuses to run the root module because the
@@ -521,31 +616,171 @@ func (ev *Evaluator) Validate(name string, val cty.Value) []ValidationFailure {
 
 	var failures []ValidationFailure
 	for _, rule := range v.Rules {
-		if rule.Condition == nil {
+		if rule.Condition == nil || !refersToVariable(rule.Condition, name) {
+			// OpenTofu rejects a rule that does not test its variable
 			continue
 		}
-		r := ev.Eval(rule.Condition, nil)
-		if !r.IsKnown() {
-			continue
+		switch res, msg := ev.evalCondition(rule.Condition, nil); res {
+		case conditionFalse:
+			failures = append(failures, ValidationFailure{Range: rule.Range, Message: ev.errorMessage(rule)})
+		case conditionError:
+			failures = append(failures, ValidationFailure{Range: rule.Range, Message: msg, Err: true})
 		}
-		cond, _ := r.Value.UnmarkDeep()
-		cond, err := convert.Convert(cond, cty.Bool)
-		if err != nil || cond.IsNull() || cond.True() {
-			continue
-		}
-		failures = append(failures, ValidationFailure{Range: rule.Range, Message: ev.errorMessage(rule)})
 	}
 	return failures
+}
+
+// refersToVariable reports whether expr refers to var.<name> itself.
+func refersToVariable(expr hcl.Expression, name string) bool {
+	for _, t := range expr.Variables() {
+		if n, ok := attrStep(t, 1); ok && t.RootName() == "var" && n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// conditionResult is the outcome of evaluating a condition statically.
+type conditionResult int
+
+const (
+	conditionUnknown conditionResult = iota
+	conditionTrue
+	conditionFalse
+	// conditionError is a condition that fails with an error although
+	// everything it refers to is known, which OpenTofu reports as well.
+	conditionError
+)
+
+// evalCondition evaluates the condition of a validation rule,
+// precondition, postcondition or check assertion. It is known only when
+// every value it refers to is known without a plan: input variables,
+// locals, path.module and path.root, and the functions this package
+// implements. Resources, data sources, module outputs, self,
+// terraform.workspace and path.cwd depend on the plan or on how OpenTofu
+// is run, so a condition that refers to any of them, directly or through
+// locals, stays unknown. So does a condition that refers to nothing, or
+// whose result is null or not a bool, which OpenTofu reports with another
+// error. For conditionError the second result is the error.
+func (ev *Evaluator) evalCondition(expr hcl.Expression, extra map[string]cty.Value) (conditionResult, string) {
+	if ev.cancelled() {
+		return conditionUnknown, ""
+	}
+	traversals := expr.Variables()
+	if len(traversals) == 0 {
+		return conditionUnknown, ""
+	}
+	if _, ok := unsupportedFunction(expr, ev.funcs); ok {
+		return conditionUnknown, ""
+	}
+	if !ev.staticOnly(expr, make(map[string]bool)) {
+		return conditionUnknown, ""
+	}
+	ctx := ev.evalContext(traversals, extra)
+	marked := false
+	for _, t := range traversals {
+		v, diags := t.TraverseAbs(ctx)
+		if diags.HasErrors() || !v.IsWhollyKnown() {
+			return conditionUnknown, ""
+		}
+		if containsMarked(v) {
+			marked = true
+		}
+	}
+	if forIterations(expr, ctx) > maxForIterations {
+		return conditionUnknown, ""
+	}
+	val, diags := expr.Value(ctx)
+	if diags.HasErrors() {
+		if marked {
+			// the error could quote a sensitive or ephemeral value
+			return conditionUnknown, ""
+		}
+		return conditionError, diagSummary(diags)
+	}
+	budget := maxValueNodes
+	if known, ok := wholeKnownWithin(val, &budget); !known || !ok {
+		return conditionUnknown, ""
+	}
+	val, _ = val.UnmarkDeep()
+	val, err := convert.Convert(val, cty.Bool)
+	if err != nil || val.IsNull() {
+		return conditionUnknown, ""
+	}
+	if val.True() {
+		return conditionTrue, ""
+	}
+	return conditionFalse, ""
+}
+
+// staticOnly reports whether expr, and the locals it refers to, refer
+// only to values that evalCondition may use: input variables, locals,
+// path.module, path.root and iteration symbols.
+func (ev *Evaluator) staticOnly(expr hcl.Expression, seen map[string]bool) bool {
+	for _, t := range expr.Variables() {
+		switch t.RootName() {
+		case "var", "each", "count":
+		case "path":
+			if name, ok := attrStep(t, 1); !ok || (name != "module" && name != "root") {
+				return false
+			}
+		case "local":
+			name, ok := attrStep(t, 1)
+			if !ok {
+				return false
+			}
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			l, ok := ev.locals[name]
+			if !ok || !ev.staticOnly(l.Expr, seen) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// referencedVariables returns the input variables that expr refers to,
+// directly or through locals.
+func (ev *Evaluator) referencedVariables(expr hcl.Expression, vars map[string]bool, seen map[string]bool) {
+	for _, t := range expr.Variables() {
+		name, ok := attrStep(t, 1)
+		if !ok {
+			continue
+		}
+		switch t.RootName() {
+		case "var":
+			vars[name] = true
+		case "local":
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			if l, ok := ev.locals[name]; ok {
+				ev.referencedVariables(l.Expr, vars, seen)
+			}
+		}
+	}
 }
 
 // errorMessage renders the error_message of a rule, or returns its source
 // when it is not known statically. A message built from a sensitive or
 // ephemeral value is not shown, as OpenTofu does not show it.
 func (ev *Evaluator) errorMessage(rule ValidationRule) string {
-	if rule.ErrorMessage == nil {
+	return ev.renderMessage(rule.ErrorMessage, rule.MessageSource, nil)
+}
+
+// renderMessage renders an error_message expression with the iteration
+// values extra, or returns its source when it is not known statically.
+func (ev *Evaluator) renderMessage(expr hcl.Expression, source string, extra map[string]cty.Value) string {
+	if expr == nil {
 		return ""
 	}
-	r := ev.Eval(rule.ErrorMessage, nil)
+	r := ev.Eval(expr, extra)
 	switch {
 	case r.IsKnown() && r.IsSensitive() && redactedText(r.Value) == ephemeralText:
 		return "(the error message includes an ephemeral value, so it is not shown)"
@@ -554,7 +789,7 @@ func (ev *Evaluator) errorMessage(rule ValidationRule) string {
 	case r.IsKnown() && r.Value.Type() == cty.String && !r.Value.IsNull():
 		return strings.TrimSpace(r.Value.AsString())
 	}
-	return strings.TrimSpace(rule.MessageSource)
+	return strings.TrimSpace(source)
 }
 
 // validationResult is the Rejected result for a value that fails rules.
@@ -581,17 +816,49 @@ func (ev *Evaluator) validateCallValue(v *Variable, cv *CallValue) {
 // applyValidations checks the value of every variable against its rules
 // and makes the values that fail unknown, with the failure as the cause.
 func (ev *Evaluator) applyValidations() {
-	failed := make(map[string][]ValidationFailure)
-	for _, name := range mapKeys(ev.vars) {
-		if failures := ev.Validate(name, ev.varValues[name]); len(failures) > 0 {
-			failed[name] = failures
-		}
-	}
+	failed := ev.validateAll(mapKeys(ev.vars))
 	ev.failures = failed
 	for name, failures := range failed {
 		ev.varValues[name] = cty.DynamicVal
 		ev.varCauses[name] = validationResult("var."+name, failures)
 	}
+}
+
+// validateAll checks the current values of the variables names against
+// their rules, as OpenTofu checks every variable of a module. OpenTofu
+// skips the rules of a variable that refer, directly or through locals,
+// to another variable whose value fails its own rules, so such a
+// variable is left out.
+func (ev *Evaluator) validateAll(names []string) map[string][]ValidationFailure {
+	failed := make(map[string][]ValidationFailure)
+	for _, name := range names {
+		if failures := ev.Validate(name, ev.varValues[name]); len(failures) > 0 {
+			failed[name] = failures
+		}
+	}
+	if len(failed) < 2 {
+		return failed
+	}
+	skipped := make(map[string]bool)
+	for name := range failed {
+		refs := make(map[string]bool)
+		for _, rule := range ev.vars[name].Rules {
+			for _, expr := range []hcl.Expression{rule.Condition, rule.ErrorMessage} {
+				if expr != nil {
+					ev.referencedVariables(expr, refs, make(map[string]bool))
+				}
+			}
+		}
+		for other := range refs {
+			if _, ok := failed[other]; ok && other != name {
+				skipped[name] = true
+			}
+		}
+	}
+	for name := range skipped {
+		delete(failed, name)
+	}
+	return failed
 }
 
 // callValueFor evaluates the value that the module call block of this
@@ -777,6 +1044,7 @@ func (ev *Evaluator) decodeVariable(filename string, f *hcl.File, block *hcl.Blo
 			v.HasDefault = true
 			v.Default = val
 			v.DefaultSource = sourceText(f, attr.Expr.Range())
+			v.DefaultRange = attr.Expr.Range()
 		}
 	}
 }
@@ -790,29 +1058,54 @@ func (v *Variable) convert(val cty.Value) (cty.Value, error) {
 	return convert.Convert(val, v.Type)
 }
 
-// Effective returns the value OpenTofu would use when no -var, -var-file
-// or TF_VAR_ environment variable is given, and where it comes from: a
-// tfvars file name, or "default".
+// Effective returns the value OpenTofu would use with the module's
+// inputs (its -var-file files and TF_VAR_ variables, see Inputs) and no
+// -var, and where it comes from: a tfvars file name, TF_VAR_<name>, or
+// "default".
 func (v *Variable) Effective() (cty.Value, string, bool) {
+	val, a, ok := v.effective()
+	switch {
+	case !ok:
+		return cty.NilVal, "", false
+	case a == nil:
+		return val, "default", true
+	}
+	return val, a.File, true
+}
+
+// effective is Effective with the winning assignment, nil for the
+// default.
+func (v *Variable) effective() (cty.Value, *Assignment, bool) {
 	for i := len(v.Assignments) - 1; i >= 0; i-- {
-		a := v.Assignments[i]
+		a := &v.Assignments[i]
 		val, err := v.convert(a.Value)
 		if err != nil {
-			return cty.NilVal, "", false
+			return cty.NilVal, nil, false
 		}
 		if val.IsNull() && !v.Nullable {
 			break
 		}
-		return val, a.File, true
+		return val, a, true
 	}
 	if v.HasDefault {
 		val, err := v.convert(v.Default)
 		if err != nil {
-			return cty.NilVal, "", false
+			return cty.NilVal, nil, false
 		}
-		return val, "default", true
+		return val, nil, true
 	}
-	return cty.NilVal, "", false
+	return cty.NilVal, nil, false
+}
+
+// assignment returns the assignment from source (a file name or
+// TF_VAR_<name>) that Effective names, or nil.
+func (v *Variable) assignment(source string) *Assignment {
+	for i := len(v.Assignments) - 1; i >= 0; i-- {
+		if v.Assignments[i].File == source {
+			return &v.Assignments[i]
+		}
+	}
+	return nil
 }
 
 // EvalLocal evaluates a local by name, following references to other

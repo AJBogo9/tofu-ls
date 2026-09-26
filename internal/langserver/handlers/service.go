@@ -38,6 +38,7 @@ import (
 	"github.com/opentofu/tofu-ls/internal/scheduler"
 	"github.com/opentofu/tofu-ls/internal/settings"
 	"github.com/opentofu/tofu-ls/internal/state"
+	"github.com/opentofu/tofu-ls/internal/staticval"
 	"github.com/opentofu/tofu-ls/internal/tofu/discovery"
 	"github.com/opentofu/tofu-ls/internal/tofu/exec"
 	"github.com/opentofu/tofu-ls/internal/walker"
@@ -90,6 +91,9 @@ type service struct {
 	additionalHandlers rpch.Map
 
 	inlayHints settings.InlayHints
+	// valueInputs are the -var-file files and TF_VAR_ variables chosen
+	// for static values (tofu-ls.values.inputs).
+	valueInputs *staticval.InputsStore
 	// inlayHintRefresh is set when the client accepts
 	// workspace/inlayHint/refresh.
 	inlayHintRefresh bool
@@ -447,6 +451,7 @@ func (svc *service) Assigner() (jrpc2.Assigner, error) {
 			ctx = lsctx.WithCommandPrefix(ctx, &commandPrefix)
 			ctx = lsctx.WithRootDirectory(ctx, &rootDir)
 			ctx = lsctx.WithDiagnosticsNotifier(ctx, svc.diagsNotifier)
+			ctx = lsctx.WithValidationOptions(ctx, &validationOptions)
 			ctx = ilsp.ContextWithClientName(ctx, &clientName)
 			ctx = exec.WithExecutorOpts(ctx, svc.tfExecOpts)
 			ctx = exec.WithExecutorFactory(ctx, svc.tfExecFactory)
@@ -609,6 +614,10 @@ func (svc *service) configureSessionDependencies(ctx context.Context, cfgOpts *s
 			return err
 		}
 		modulesFeature.SetLogger(svc.logger)
+		if svc.valueInputs == nil {
+			svc.valueInputs = staticval.NewInputsStore()
+		}
+		modulesFeature.SetInputs(svc.valueInputs)
 		modulesFeature.Start(svc.sessCtx)
 
 		variablesFeature, err := fvariables.NewVariablesFeature(svc.eventBus, svc.stateStore, svc.fs,
@@ -652,7 +661,7 @@ func (svc *service) configureSessionDependencies(ctx context.Context, cfgOpts *s
 	svc.decoder.SetContext(decoderContext)
 
 	moduleHooks := []notifier.Hook{
-		updateDiagnostics(svc.features, svc.diagsNotifier),
+		updateDiagnostics(svc.features, svc.diagsNotifier, svc.valueInputs),
 	}
 
 	cc, err := ilsp.ClientCapabilities(ctx)

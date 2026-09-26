@@ -82,15 +82,21 @@ func (ev *Evaluator) VarsFileHover(filename string, file *hcl.File, pos hcl.Pos)
 		}
 	}
 
-	if !IsAutoVarsFile(filename) {
+	selected := ev.mod.IsVarFile(filename)
+	if !IsAutoVarsFile(filename) && !selected {
 		fmt.Fprintf(&b, "OpenTofu does not load `%s` by itself: it applies only with `-var-file=%s`, and then overrides the default and every automatically loaded tfvars file.\n\n", filename, filename)
 	} else if ev.mod.RootPath != "" {
 		b.WriteString("This is a child module: OpenTofu reads tfvars files only in the root module, so this value is ignored.\n\n")
 	} else if ev.refused.Kind == Rejected {
 		fmt.Fprintf(&b, "**No value is used**: %s.\n\n", ev.refused.Reason)
 	} else {
+		if selected {
+			fmt.Fprintf(&b, "Selected environment: OpenTofu applies this file with `-var-file=%s`.\n\n", filename)
+		}
 		_, winner, ok := v.Effective()
 		switch {
+		case ok && winner == filename && selected:
+			b.WriteString("**This value is used**: no file after it sets the variable.\n\n")
 		case ok && winner == filename:
 			b.WriteString("**This value is used**: no automatically loaded file after it sets the variable.\n\n")
 		case ok && winner == "default" && val.IsNull() && !v.Nullable:
@@ -109,11 +115,15 @@ func (ev *Evaluator) VarsFileHover(filename string, file *hcl.File, pos hcl.Pos)
 				fmt.Fprintf(&b, "**Overridden** by the default, `%s`.\n\n", FormatCompact(winVal, 40))
 			}
 		case ok:
+			name := "`" + winner + "`"
+			if a := v.assignment(winner); a != nil {
+				name = sourceName(a)
+			}
 			if v.redacted() {
-				fmt.Fprintf(&b, "**Overridden** by `%s`.\n\n", winner)
+				fmt.Fprintf(&b, "**Overridden** by %s.\n\n", name)
 			} else {
 				winVal, _, _ := v.Effective()
-				fmt.Fprintf(&b, "**Overridden** by `%s`, which sets `%s`.\n\n", winner, FormatCompact(winVal, 40))
+				fmt.Fprintf(&b, "**Overridden** by %s, which sets `%s`.\n\n", name, FormatCompact(winVal, 40))
 			}
 		}
 		b.WriteString("_May be overridden by `-var` or `-var-file`._\n\n")

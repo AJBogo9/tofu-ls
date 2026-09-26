@@ -37,6 +37,7 @@ func cmdHandlers(svc *service) cmd.Handlers {
 		cmd.Name("module.tofu"):      removedHandler("use module.opentofu instead"),
 
 		cmd.Name(addRequiredProviderCommand): svc.addRequiredProviderHandler,
+		cmd.Name("values.inputs"):            svc.valuesInputsHandler,
 	}
 }
 

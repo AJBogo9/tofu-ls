@@ -25,11 +25,12 @@ import (
 // module: its variables get their values from those module calls, not
 // from tfvars files. Evaluation stops once ctx is done.
 func (svc *service) staticEvaluator(ctx context.Context, dir string, bodySchema *schema.BodySchema) (*staticval.Evaluator, error) {
-	mod, err := staticval.LoadModule(svc.fs, dir)
+	fsys := svc.staticFS()
+	mod, err := staticval.LoadModule(fsys, dir)
 	if err != nil {
 		return nil, err
 	}
-	staticval.AddCallers(svc.fs, mod, maxCallerNesting, svc.indexedCallers)
+	staticval.AddCallers(fsys, mod, maxCallerNesting, svc.indexedCallers)
 	ev := staticval.NewEvaluatorContext(ctx, mod)
 	ev.SetEnv(svc.staticEnv(dir, bodySchema))
 	return ev, nil
@@ -62,7 +63,7 @@ func (svc *service) indexedCallers(dir string) []staticval.Caller {
 				continue
 			}
 			if parent == nil {
-				parent, err = staticval.LoadModule(svc.fs, rec.Path())
+				parent, err = staticval.LoadModule(svc.staticFS(), rec.Path())
 				if err != nil {
 					break
 				}
@@ -79,7 +80,7 @@ func (svc *service) indexedCallers(dir string) []staticval.Caller {
 func (svc *service) staticEnv(dir string, bodySchema *schema.BodySchema) staticval.Env {
 	env := staticval.Env{
 		LoadModule: func(childDir string) (*staticval.Module, error) {
-			return staticval.LoadModule(svc.fs, childDir)
+			return staticval.LoadModule(svc.staticFS(), childDir)
 		},
 	}
 	if svc.features == nil {
@@ -192,6 +193,12 @@ func (svc *service) staticValueHover(ctx context.Context, doc *document.Document
 	var h *staticval.Hover
 	var ok bool
 	if langID == ilsp.OpenTofuVars {
+		filename := doc.Filename
+		if modDir, name, chosen := svc.valueInputs.ModuleOf(filepath.Join(dir, doc.Filename)); chosen {
+			// a -var-file file of the selected environment, which may
+			// live in a subdirectory of its module
+			dir, filename = modDir, name
+		}
 		// The module's schema, not the tfvars one, describes resources.
 		ev, err := svc.staticEvaluator(ctx, dir, nil)
 		if err != nil {
@@ -203,7 +210,7 @@ func (svc *service) staticValueHover(ctx context.Context, doc *document.Document
 		} else {
 			f, _ = hclsyntax.ParseConfig(doc.Text, doc.Filename, hcl.InitialPos)
 		}
-		h, ok = ev.VarsFileHover(doc.Filename, f, pos)
+		h, ok = ev.VarsFileHover(filename, f, pos)
 	} else {
 		f, _ := hclsyntax.ParseConfig(doc.Text, doc.Filename, hcl.InitialPos)
 		if !staticval.WantsHover(f, pos) {

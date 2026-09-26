@@ -55,6 +55,10 @@ type ValidationOptions struct {
 	// InterpolationOnly reports "${...}" templates which only wrap an
 	// expression.
 	InterpolationOnly bool `mapstructure:"interpolationOnly" default:"true"`
+	// Conditions reports values that fail their variable's validation
+	// rules, and preconditions, postconditions and check assertions that
+	// fail, when every value they need is known without a plan.
+	Conditions bool `mapstructure:"conditions" default:"true"`
 
 	// UnusedSymbols is copied from DiagnosticsOptions, so that it
 	// reaches the module jobs together with the validation options.
@@ -90,6 +94,17 @@ type InlayHints struct {
 	MaxLength int `mapstructure:"maxLength" default:"40"`
 }
 
+// Values chooses the inputs static values are computed with, as a run
+// of tofu in the module would get them.
+type Values struct {
+	// VarFiles maps module directories (paths or file URIs) to their
+	// -var-file files, relative to the module and in order.
+	VarFiles map[string][]string `mapstructure:"varFiles"`
+	// ReadEnvironment reads the TF_VAR_ variables of the language
+	// server's environment.
+	ReadEnvironment bool `mapstructure:"readEnvironment"`
+}
+
 type Tofu struct {
 	Path        string `mapstructure:"path"`
 	Timeout     string `mapstructure:"timeout"`
@@ -109,6 +124,7 @@ type Options struct {
 	Completion  CompletionOptions  `mapstructure:"completion"`
 	Diagnostics DiagnosticsOptions `mapstructure:"diagnostics"`
 	InlayHints  InlayHints         `mapstructure:"inlayHints"`
+	Values      Values             `mapstructure:"values"`
 
 	IgnoreSingleFileWarning bool `mapstructure:"ignoreSingleFileWarning"`
 
