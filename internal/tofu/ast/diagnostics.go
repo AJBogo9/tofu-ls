@@ -19,6 +19,8 @@ const (
 	TofuValidateSource
 	// UnusedSymbolsSource reports variables and locals nothing references.
 	UnusedSymbolsSource
+	// FilePathsSource reports file function paths that name no file.
+	FilePathsSource
 )
 
 func (d DiagnosticSource) String() string {

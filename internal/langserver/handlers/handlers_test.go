@@ -60,6 +60,7 @@ func initializeResponse(t *testing.T, commandPrefix string) string {
 				"documentLinkProvider": {},
 				"workspaceSymbolProvider": true,
 				"documentFormattingProvider": true,
+				"documentRangeFormattingProvider": true,
 				"renameProvider": {
 					"prepareProvider": true
 				},

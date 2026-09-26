@@ -250,6 +250,10 @@ func (f *ModulesFeature) decodeModule(ctx context.Context, dir document.DirHandl
 		Dir: dir,
 		Func: func(ctx context.Context) error {
 			err := jobs.ParseModuleConfiguration(ctx, f.fs, f.Store, path)
+			if err == nil && parseValidationOptions.EnableEnhancedValidation {
+				// needs only the parsed files too
+				f.checkPathFiles(ctx, path)
+			}
 			if err == nil && parseValidationOptions.UnusedSymbols {
 				// needs only the parsed files, so it runs right after parsing
 				return jobs.UnusedSymbols(ctx, f.fs, f.Store, path)

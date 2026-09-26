@@ -47,6 +47,7 @@ func (svc *service) Initialize(ctx context.Context, params lsp.InitializeParams)
 	}
 
 	svc.renameOptions = out.Options.Rename
+	svc.completionOptions = out.Options.Completion
 
 	expServerCaps := lsp.ExperimentalServerCapabilities{}
 
@@ -215,6 +216,8 @@ func initializeResult(ctx context.Context) lsp.InitializeResult {
 			SignatureHelpProvider: lsp.SignatureHelpOptions{
 				TriggerCharacters: []string{"(", ","},
 			},
+
+			DocumentRangeFormattingProvider: true,
 		},
 	}
 

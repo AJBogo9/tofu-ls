@@ -41,6 +41,12 @@ func HCLDiagsToLSP(hclDiags hcl.Diagnostics, source string) []lsp.Diagnostic {
 			Source:   source,
 			Message:  msg,
 		}
+		if c, ok := hclDiag.Extra.(DiagnosticCode); ok {
+			diag.Code = c.Code
+			if len(c.Data) > 0 {
+				diag.Data = c.Data
+			}
+		}
 		if _, ok := hclDiag.Extra.(UnnecessaryCode); ok {
 			// a hint the client renders faded, not a problem
 			diag.Severity = lsp.SeverityHint

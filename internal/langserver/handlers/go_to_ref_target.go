@@ -60,6 +60,10 @@ func (svc *service) goToReferenceTarget(ctx context.Context, params lsp.TextDocu
 	}
 	svc.stateStore.JobStore.WaitForJobs(ctx, jobIds...)
 
+	if target, ok := svc.filePathTarget(ctx, doc, pos); ok {
+		return decoder.ReferenceTargets{target}, nil
+	}
+
 	path := lang.Path{
 		Path:       doc.Dir.Path(),
 		LanguageID: string(ilsp.ParseLanguageID(doc.LanguageID)),

@@ -100,6 +100,9 @@ type service struct {
 	workspace workspaceDirs
 
 	singleFileMode bool
+
+	// completionOptions are read from the initialization options.
+	completionOptions settings.CompletionOptions
 }
 
 var discardLogs = log.New(io.Discard, "", 0)
@@ -305,6 +308,17 @@ func (svc *service) Assigner() (jrpc2.Assigner, error) {
 			ctx = exec.WithExecutorFactory(ctx, svc.tfExecFactory)
 
 			return handle(ctx, req, svc.TextDocumentFormatting)
+		},
+		"textDocument/rangeFormatting": func(ctx context.Context, req *jrpc2.Request) (interface{}, error) {
+			err := session.CheckInitializationIsConfirmed()
+			if err != nil {
+				return nil, err
+			}
+
+			ctx = exec.WithExecutorOpts(ctx, svc.tfExecOpts)
+			ctx = exec.WithExecutorFactory(ctx, svc.tfExecFactory)
+
+			return handle(ctx, req, svc.TextDocumentRangeFormatting)
 		},
 		"textDocument/inlayHint": func(ctx context.Context, req *jrpc2.Request) (interface{}, error) {
 			err := session.CheckInitializationIsConfirmed()
