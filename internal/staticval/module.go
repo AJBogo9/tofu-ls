@@ -43,6 +43,10 @@ type Module struct {
 	// automatically to its parsed content.
 	VarsFiles map[string]*hcl.File
 
+	// VarsFileErrors maps the base name of each of those tfvars files that
+	// has a syntax error to its first error. OpenTofu refuses to run then.
+	VarsFileErrors map[string]string
+
 	// Workspace is the selected workspace, "default" when none is known.
 	Workspace string
 
@@ -131,10 +135,11 @@ func LoadModule(fsys FS, dir string) (*Module, error) {
 	}
 
 	mod := &Module{
-		Path:      dir,
-		Files:     make(map[string]*hcl.File),
-		VarsFiles: make(map[string]*hcl.File),
-		Workspace: "default",
+		Path:           dir,
+		Files:          make(map[string]*hcl.File),
+		VarsFiles:      make(map[string]*hcl.File),
+		VarsFileErrors: make(map[string]string),
+		Workspace:      "default",
 	}
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -150,14 +155,20 @@ func LoadModule(fsys FS, dir string) (*Module, error) {
 		if err != nil {
 			continue
 		}
-		f := parseFile(filepath.Join(dir, name), src)
+		f, diags := parseFile(filepath.Join(dir, name), src)
 		if f == nil {
+			if isVars {
+				mod.VarsFileErrors[name] = diagLine(diags)
+			}
 			continue
 		}
 		if isConfig {
 			mod.Files[name] = f
 		} else {
 			mod.VarsFiles[name] = f
+			if diags.HasErrors() {
+				mod.VarsFileErrors[name] = diagLine(diags)
+			}
 		}
 	}
 
@@ -188,37 +199,44 @@ func LoadModule(fsys FS, dir string) (*Module, error) {
 // most of that work. An entry is used only while the content is the same.
 var parsedFiles = struct {
 	sync.Mutex
-	files map[string]*hcl.File
-}{files: make(map[string]*hcl.File)}
+	files map[string]parsedFile
+}{files: make(map[string]parsedFile)}
+
+type parsedFile struct {
+	file  *hcl.File
+	diags hcl.Diagnostics
+}
 
 // maxParsedFiles bounds the cache; it is emptied when full.
 const maxParsedFiles = 2048
 
 // parseFile parses a configuration or tfvars file, native or JSON, keeping
-// whatever the parser recovered from a file with errors. The returned
-// file is shared and must not be modified.
-func parseFile(path string, src []byte) *hcl.File {
+// whatever the parser recovered from a file with errors, and the errors.
+// The returned file is shared and must not be modified.
+func parseFile(path string, src []byte) (*hcl.File, hcl.Diagnostics) {
 	parsedFiles.Lock()
-	f, ok := parsedFiles.files[path]
+	p, ok := parsedFiles.files[path]
 	parsedFiles.Unlock()
-	if ok && bytes.Equal(f.Bytes, src) {
-		return f
+	if ok && bytes.Equal(p.file.Bytes, src) {
+		return p.file, p.diags
 	}
+	var f *hcl.File
+	var diags hcl.Diagnostics
 	if strings.HasSuffix(path, ".json") {
-		f, _ = hcljson.Parse(src, path)
+		f, diags = hcljson.Parse(src, path)
 	} else {
-		f, _ = hclsyntax.ParseConfig(src, path, hcl.InitialPos)
+		f, diags = hclsyntax.ParseConfig(src, path, hcl.InitialPos)
 	}
 	if f == nil {
-		return nil
+		return nil, diags
 	}
 	parsedFiles.Lock()
 	if len(parsedFiles.files) >= maxParsedFiles {
-		parsedFiles.files = make(map[string]*hcl.File)
+		parsedFiles.files = make(map[string]parsedFile)
 	}
-	parsedFiles.files[path] = f
+	parsedFiles.files[path] = parsedFile{file: f, diags: diags}
 	parsedFiles.Unlock()
-	return f
+	return f, diags
 }
 
 // sortedFileNames returns the configuration file names in the order

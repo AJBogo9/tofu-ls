@@ -4,6 +4,7 @@
 package staticval
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -21,6 +22,11 @@ import (
 // SensitiveMark marks values that come from a sensitive variable. The
 // cty functions and HCL operators carry it into every derived value.
 const SensitiveMark = earlydecoder.SensitiveMark
+
+// EphemeralMark marks values that come from an ephemeral variable or
+// output. Like SensitiveMark it carries into every derived value, and
+// OpenTofu never shows such a value ("(ephemeral value)").
+const EphemeralMark = "ephemeral"
 
 // Kind says whether a value is known and, if not, why.
 type Kind int
@@ -44,6 +50,13 @@ const (
 	// that its module calls set to different values, or that callers not
 	// resolved set.
 	PerCall
+	// Rejected means OpenTofu refuses the value, so there is none: it
+	// fails a validation rule, a tfvars file is invalid, or a meta-argument
+	// or not nullable variable is null.
+	Rejected
+	// FromState means the value is an argument that lifecycle
+	// ignore_changes keeps at its value in the state.
+	FromState
 )
 
 // Result is the outcome of evaluating an expression.
@@ -64,9 +77,31 @@ func (r Result) IsKnown() bool {
 	return r.Kind == Known
 }
 
-// IsSensitive reports whether any part of the value is sensitive.
+// IsSensitive reports whether any part of the value is sensitive (or
+// ephemeral).
 func (r Result) IsSensitive() bool {
-	return r.Value != cty.NilVal && r.Value.ContainsMarked()
+	return r.Value != cty.NilVal && containsMarked(r.Value)
+}
+
+// containsMarked is cty's ContainsMarked without building the path of
+// every element, which is most of its cost on a large value.
+func containsMarked(v cty.Value) bool {
+	if v.IsMarked() {
+		return true
+	}
+	if !v.IsKnown() || v.IsNull() {
+		return false
+	}
+	ty := v.Type()
+	if !ty.IsCollectionType() && !ty.IsObjectType() && !ty.IsTupleType() {
+		return false
+	}
+	for it := v.ElementIterator(); it.Next(); {
+		if _, e := it.Element(); containsMarked(e) {
+			return true
+		}
+	}
+	return false
 }
 
 // Variable is a variable declaration with every value OpenTofu would
@@ -91,6 +126,8 @@ type Variable struct {
 	Ephemeral   bool
 	Deprecated  string
 	Validations int
+	// Rules are the validation blocks.
+	Rules []ValidationRule
 
 	// Assignments are the tfvars values in the order OpenTofu applies
 	// them; the last one wins.
@@ -107,8 +144,28 @@ type CallValue struct {
 	// File is the file of the module call, relative to the child.
 	File string
 	// Set is false when the call leaves the variable to its default.
-	Set    bool
-	Result Result
+	Set bool
+	// NullReplaced is true when the call passes null to a variable that is
+	// not nullable, so that OpenTofu uses the default instead.
+	NullReplaced bool
+	Result       Result
+}
+
+// ValidationRule is a validation block of a variable.
+type ValidationRule struct {
+	// Range is the header of the validation block.
+	Range        hcl.Range
+	Condition    hcl.Expression
+	ErrorMessage hcl.Expression
+	// MessageSource is the error_message as written.
+	MessageSource string
+}
+
+// ValidationFailure is a validation rule that a value fails.
+type ValidationFailure struct {
+	Range hcl.Range
+	// Message is the rule's error_message, rendered when it can be.
+	Message string
 }
 
 // Assignment is a value given to a variable in a tfvars file.
@@ -132,6 +189,7 @@ type Local struct {
 // Evaluator evaluates expressions in the context of one module. It is
 // not safe for concurrent use.
 type Evaluator struct {
+	ctx   context.Context
 	mod   *Module
 	funcs map[string]function.Function
 
@@ -157,6 +215,17 @@ type Evaluator struct {
 	depth int
 	// readingData guards against data sources that depend on each other.
 	readingData map[string]bool
+	// configured and dataTiming cache configuredAttribute and
+	// DataReadTiming: chained resources and data sources would otherwise
+	// evaluate each other exponentially often.
+	configured map[string]cty.Value
+	dataTiming map[string]Result
+	// refused says why OpenTofu refuses to run this root module when an
+	// automatically loaded tfvars file is invalid. It is the zero Result
+	// otherwise.
+	refused Result
+	// failures holds the validation rules that each variable's value fails.
+	failures map[string][]ValidationFailure
 }
 
 // maxModuleDepth caps how deep module outputs are evaluated through
@@ -171,6 +240,12 @@ func (ev *Evaluator) SetEnv(host Env) {
 
 // NewEvaluator decodes the variables and locals of mod.
 func NewEvaluator(mod *Module) *Evaluator {
+	return NewEvaluatorContext(context.Background(), mod)
+}
+
+// NewEvaluatorContext is NewEvaluator for a request: once ctx is done,
+// evaluations stop and return NotEvaluated.
+func NewEvaluatorContext(ctx context.Context, mod *Module) *Evaluator {
 	// OpenTofu resolves relative file paths against the working
 	// directory, which is the root module, and path.module is relative to
 	// it. Files may be read from the root's tree and the module's own.
@@ -179,6 +254,7 @@ func NewEvaluator(mod *Module) *Evaluator {
 		baseDir = mod.RootPath
 	}
 	ev := &Evaluator{
+		ctx:          ctx,
 		mod:          mod,
 		funcs:        earlydecoder.StaticFunctions(baseDir, mod.Path),
 		vars:         make(map[string]*Variable),
@@ -188,12 +264,25 @@ func NewEvaluator(mod *Module) *Evaluator {
 		localResults: make(map[string]Result),
 		evaluating:   make(map[string]bool),
 		readingData:  make(map[string]bool),
+		configured:   make(map[string]cty.Value),
+		dataTiming:   make(map[string]Result),
+		failures:     make(map[string][]ValidationFailure),
 
 		moduleOutputs:   make(map[string]map[string]Result),
 		moduleInstances: make(map[string]cty.Value),
 	}
 	ev.decode()
 	return ev
+}
+
+// newEvaluator is NewEvaluator for another module of the same request.
+func (ev *Evaluator) newEvaluator(mod *Module) *Evaluator {
+	return NewEvaluatorContext(ev.ctx, mod)
+}
+
+// cancelled reports whether the request that the evaluator serves is done.
+func (ev *Evaluator) cancelled() bool {
+	return ev.ctx != nil && ev.ctx.Err() != nil
 }
 
 // Module returns the module the evaluator works on.
@@ -261,21 +350,41 @@ func (ev *Evaluator) decode() {
 		}
 	}
 
-	varsFiles := VarsFileOrder(mapKeys(ev.mod.VarsFiles))
+	names := mapKeys(ev.mod.VarsFiles)
+	for name := range ev.mod.VarsFileErrors {
+		if _, ok := ev.mod.VarsFiles[name]; !ok {
+			names = append(names, name)
+		}
+	}
+	varsFiles := VarsFileOrder(names)
 	if ev.mod.RootPath != "" {
 		// OpenTofu reads tfvars files only for the root module.
 		varsFiles = nil
 	}
 	for _, name := range varsFiles {
+		if msg := ev.mod.VarsFileErrors[name]; msg != "" {
+			ev.refuse(name, msg)
+		}
 		f := ev.mod.VarsFiles[name]
-		attrs, _ := f.Body.JustAttributes()
-		for attrName, attr := range attrs {
-			v, ok := ev.vars[attrName]
-			if !ok {
-				continue
-			}
+		if f == nil {
+			continue
+		}
+		attrs, diags := f.Body.JustAttributes()
+		if diags.HasErrors() {
+			// for example a block, which tfvars files may not have
+			ev.refuse(name, diagLine(diags))
+		}
+		for _, attrName := range mapKeys(attrs) {
+			attr := attrs[attrName]
+			// OpenTofu reads every value as a constant first, whether or
+			// not a variable of that name is declared.
 			val, diags := attr.Expr.Value(nil)
 			if diags.HasErrors() {
+				ev.refuse(name, diagLine(diags))
+				continue
+			}
+			v, ok := ev.vars[attrName]
+			if !ok {
 				continue
 			}
 			a := Assignment{File: name, Range: attr.Range, Value: val}
@@ -291,7 +400,7 @@ func (ev *Evaluator) decode() {
 		// several calls in one parent share its evaluator
 		parentEv, ok := parents[c.Parent]
 		if !ok {
-			parentEv = NewEvaluator(c.Parent)
+			parentEv = ev.newEvaluator(c.Parent)
 			parents[c.Parent] = parentEv
 		}
 		block := parentEv.findModuleCall(c.Name)
@@ -299,7 +408,9 @@ func (ev *Evaluator) decode() {
 			continue
 		}
 		for _, v := range ev.vars {
-			v.CallValues = append(v.CallValues, parentEv.callValueFor(block, v, ev.mod.Path))
+			cv := parentEv.callValueFor(block, v, ev.mod.Path)
+			ev.validateCallValue(v, &cv)
+			v.CallValues = append(v.CallValues, cv)
 		}
 	}
 
@@ -307,6 +418,10 @@ func (ev *Evaluator) decode() {
 		val, _, ok := v.Effective()
 		if !ok {
 			val = cty.DynamicVal
+		}
+		if ev.mod.RootPath == "" && ev.refused.Kind == Rejected {
+			val = cty.DynamicVal
+			ev.varCauses[name] = ev.refused
 		}
 		if ev.mod.RootPath != "" {
 			// A child module gets its values from the module calls.
@@ -319,10 +434,163 @@ func (ev *Evaluator) decode() {
 				ev.varCauses[name] = r
 			}
 		}
-		if v.Sensitive {
-			val = val.Mark(SensitiveMark)
+		ev.varValues[name] = v.markValue(val)
+	}
+	ev.applyValidations()
+}
+
+// refuse records that OpenTofu refuses to run the root module because the
+// tfvars file name is invalid. The first invalid file is the one named.
+func (ev *Evaluator) refuse(name, problem string) {
+	if ev.refused.Kind == Rejected {
+		return
+	}
+	ev.refused = Result{
+		Value:  cty.DynamicVal,
+		Kind:   Rejected,
+		Reason: fmt.Sprintf("OpenTofu refuses to run: `%s` is invalid (%s)", name, problem),
+	}
+}
+
+// diagLine renders the first error of diags with its line.
+func diagLine(diags hcl.Diagnostics) string {
+	for _, d := range diags {
+		if d.Severity != hcl.DiagError {
+			continue
 		}
-		ev.varValues[name] = val
+		msg := d.Summary
+		if d.Detail != "" {
+			msg += ": " + strings.TrimSuffix(d.Detail, ".")
+		}
+		if d.Subject != nil {
+			return fmt.Sprintf("line %d: %s", d.Subject.Start.Line, msg)
+		}
+		return msg
+	}
+	return "invalid"
+}
+
+// markValue marks a value of v as sensitive or ephemeral, as declared.
+func (v *Variable) markValue(val cty.Value) cty.Value {
+	if v.Sensitive {
+		val = val.Mark(SensitiveMark)
+	}
+	if v.Ephemeral {
+		val = val.Mark(EphemeralMark)
+	}
+	return val
+}
+
+// redacted reports whether the values of v are never shown.
+func (v *Variable) redacted() bool {
+	return v.Sensitive || v.Ephemeral
+}
+
+// Validate evaluates the validation rules of the variable name for val,
+// as OpenTofu checks every value a variable gets: its default, a tfvars
+// value or a module call's argument. It returns the rules that val fails.
+// A rule whose condition is not known statically is skipped, so every
+// failure returned is certain, while no failures means only that none can
+// be proven.
+func (ev *Evaluator) Validate(name string, val cty.Value) []ValidationFailure {
+	v, ok := ev.vars[name]
+	if !ok || len(v.Rules) == 0 || val == cty.NilVal || !val.IsWhollyKnown() {
+		return nil
+	}
+	// The rules see var.<name> as val. Nothing computed with it may leak
+	// into the caches, nor anything cached with another value into the
+	// rules, and Validate may run before SetEnv.
+	savedVal, hadVal := ev.varValues[name]
+	locals, configured, dataTiming := ev.localResults, ev.configured, ev.dataTiming
+	outputs, instances := ev.moduleOutputs, ev.moduleInstances
+	ev.varValues[name] = v.markValue(val)
+	ev.localResults = make(map[string]Result)
+	ev.configured = make(map[string]cty.Value)
+	ev.dataTiming = make(map[string]Result)
+	ev.moduleOutputs = make(map[string]map[string]Result)
+	ev.moduleInstances = make(map[string]cty.Value)
+	defer func() {
+		if hadVal {
+			ev.varValues[name] = savedVal
+		} else {
+			delete(ev.varValues, name)
+		}
+		ev.localResults, ev.configured, ev.dataTiming = locals, configured, dataTiming
+		ev.moduleOutputs, ev.moduleInstances = outputs, instances
+	}()
+
+	var failures []ValidationFailure
+	for _, rule := range v.Rules {
+		if rule.Condition == nil {
+			continue
+		}
+		r := ev.Eval(rule.Condition, nil)
+		if !r.IsKnown() {
+			continue
+		}
+		cond, _ := r.Value.UnmarkDeep()
+		cond, err := convert.Convert(cond, cty.Bool)
+		if err != nil || cond.IsNull() || cond.True() {
+			continue
+		}
+		failures = append(failures, ValidationFailure{Range: rule.Range, Message: ev.errorMessage(rule)})
+	}
+	return failures
+}
+
+// errorMessage renders the error_message of a rule, or returns its source
+// when it is not known statically. A message built from a sensitive or
+// ephemeral value is not shown, as OpenTofu does not show it.
+func (ev *Evaluator) errorMessage(rule ValidationRule) string {
+	if rule.ErrorMessage == nil {
+		return ""
+	}
+	r := ev.Eval(rule.ErrorMessage, nil)
+	switch {
+	case r.IsKnown() && r.IsSensitive() && redactedText(r.Value) == ephemeralText:
+		return "(the error message includes an ephemeral value, so it is not shown)"
+	case r.IsKnown() && r.IsSensitive():
+		return "(the error message includes a sensitive value, so it is not shown)"
+	case r.IsKnown() && r.Value.Type() == cty.String && !r.Value.IsNull():
+		return strings.TrimSpace(r.Value.AsString())
+	}
+	return strings.TrimSpace(rule.MessageSource)
+}
+
+// validationResult is the Rejected result for a value that fails rules.
+func validationResult(ref string, failures []ValidationFailure) Result {
+	return Result{
+		Value:  cty.DynamicVal,
+		Kind:   Rejected,
+		Reason: fmt.Sprintf("OpenTofu rejects the value of `%s`, which fails its validation: %q", ref, failures[0].Message),
+	}
+}
+
+// validateCallValue checks the known value that a module call passes to v
+// against v's rules. Only rules that need no other value of this module
+// can be decided here, since the module's own values are not set yet.
+func (ev *Evaluator) validateCallValue(v *Variable, cv *CallValue) {
+	if !cv.Result.IsKnown() {
+		return
+	}
+	if failures := ev.Validate(v.Name, cv.Result.Value); len(failures) > 0 {
+		cv.Result = validationResult("var."+v.Name, failures)
+	}
+}
+
+// applyValidations checks the value of every variable against its rules
+// and makes the values that fail unknown, with the failure as the cause.
+func (ev *Evaluator) applyValidations() {
+	failed := make(map[string][]ValidationFailure)
+	for _, name := range mapKeys(ev.vars) {
+		if failures := ev.Validate(name, ev.varValues[name]); len(failures) > 0 {
+			failed[name] = failures
+		}
+	}
+	ev.failures = failed
+	for name, failures := range failed {
+		ev.varValues[name] = cty.DynamicVal
+		ev.varCauses[name] = validationResult("var."+name, failures)
 	}
 }
 
@@ -346,7 +614,20 @@ func (ev *Evaluator) callValueForInstance(block *hclsyntax.Block, v *Variable, c
 		cv.Result = Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: cv.Call + " differs per instance (for_each or count)"}
 	case set:
 		cv.Result = ev.Eval(attr.Expr, each)
-		if cv.Result.IsKnown() {
+		switch {
+		case cv.Result.IsKnown() && cv.Result.Value.IsNull() && !v.Nullable && v.HasDefault:
+			// OpenTofu uses the default for a null argument of a variable
+			// that is not nullable.
+			cv.NullReplaced = true
+			_, marks := cv.Result.Value.Unmark()
+			if val, err := v.convert(v.Default); err != nil {
+				cv.Result = Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: err.Error()}
+			} else {
+				cv.Result = Result{Value: val.WithMarks(marks), Kind: Known}
+			}
+		case cv.Result.IsKnown() && cv.Result.Value.IsNull() && !v.Nullable:
+			cv.Result = Result{Value: cty.DynamicVal, Kind: Rejected, Reason: fmt.Sprintf("OpenTofu rejects %s: it sets the variable `%s`, which is not nullable and has no default, to null", cv.Call, v.Name)}
+		case cv.Result.IsKnown():
 			val, err := v.convert(cv.Result.Value)
 			if err != nil {
 				cv.Result = Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: fmt.Sprintf("%s passes a value that does not match the type: %s", cv.Call, err)}
@@ -388,9 +669,11 @@ func (v *Variable) callValue() (cty.Value, bool) {
 		}
 	}
 	for _, cv := range v.CallValues {
-		// Equal content is still sensitive when any call marks it so.
-		if cv.Result.IsSensitive() && !val.ContainsMarked() {
-			val = val.Mark(SensitiveMark)
+		// Equal content is still sensitive or ephemeral when any call
+		// marks it so.
+		if cv.Result.IsSensitive() {
+			_, marks := cv.Result.Value.UnmarkDeep()
+			val = val.WithMarks(marks)
 		}
 	}
 	return val, true
@@ -425,24 +708,37 @@ func (ev *Evaluator) decodeVariable(filename string, f *hcl.File, block *hcl.Blo
 		}
 		ev.vars[name] = v
 	}
-	wasSensitive := v.Sensitive
+	wasSensitive, wasEphemeral := v.Sensitive, v.Ephemeral
 	defer func() {
-		// An override never makes a sensitive value displayable.
+		// An override never makes a sensitive or ephemeral value
+		// displayable.
 		v.Sensitive = v.Sensitive || wasSensitive
+		v.Ephemeral = v.Ephemeral || wasEphemeral
 	}()
 
 	content, _, _ := block.Body.PartialContent(variableSchema)
 	if content == nil {
 		return
 	}
-	validations := 0
+	var rules []ValidationRule
 	for _, b := range content.Blocks {
-		if b.Type == "validation" {
-			validations++
+		if b.Type != "validation" {
+			continue
 		}
+		rule := ValidationRule{Range: b.DefRange}
+		attrs, _ := b.Body.JustAttributes()
+		if a, ok := attrs["condition"]; ok {
+			rule.Condition = a.Expr
+		}
+		if a, ok := attrs["error_message"]; ok {
+			rule.ErrorMessage = a.Expr
+			rule.MessageSource = sourceText(f, a.Expr.Range())
+		}
+		rules = append(rules, rule)
 	}
-	if !merge || validations > 0 {
-		v.Validations = validations
+	if !merge || len(rules) > 0 {
+		v.Validations = len(rules)
+		v.Rules = rules
 	}
 	if attr, ok := content.Attributes["description"]; ok {
 		if val, diags := attr.Expr.Value(nil); !diags.HasErrors() && val.Type() == cty.String && val.IsKnown() && !val.IsNull() {
@@ -542,6 +838,9 @@ func (ev *Evaluator) EvalLocal(name string) Result {
 // Eval evaluates expr in the module's scope. extra adds values for
 // iteration symbols such as each and count.
 func (ev *Evaluator) Eval(expr hcl.Expression, extra map[string]cty.Value) Result {
+	if ev.cancelled() {
+		return Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: "the request was cancelled"}
+	}
 	if name, ok := unsupportedFunction(expr, ev.funcs); ok {
 		return Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: name + "()"}
 	}
@@ -562,7 +861,12 @@ func (ev *Evaluator) Eval(expr hcl.Expression, extra map[string]cty.Value) Resul
 		}
 		return Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: diagSummary(diags)}
 	}
-	if val.IsWhollyKnown() {
+	budget := maxValueNodes
+	known, ok := wholeKnownWithin(val, &budget)
+	if !ok {
+		return Result{Value: cty.DynamicVal, Kind: NotEvaluated, Reason: fmt.Sprintf("the value has more than %d elements, too many to evaluate statically", maxValueNodes)}
+	}
+	if known {
 		return Result{Value: val, Kind: Known}
 	}
 	if r, ok := ev.unknownCause(expr, ctx); ok {
@@ -582,6 +886,39 @@ func (ev *Evaluator) Eval(expr hcl.Expression, extra map[string]cty.Value) Resul
 // maxForIterations caps the iterations of (nested) for expressions that
 // an evaluation may run.
 const maxForIterations = 50000
+
+// maxValueNodes caps the elements, at every depth, of a value that an
+// evaluation inspects. A for expression that refers to a large list in
+// each of its iterations builds a value with billions of elements that
+// share memory, and walking it would take minutes.
+const maxValueNodes = 2000000
+
+// wholeKnownWithin is cty's IsWhollyKnown that gives up, with ok false,
+// once it has visited budget elements. It stops at the first unknown one.
+func wholeKnownWithin(v cty.Value, budget *int) (known, ok bool) {
+	*budget--
+	if *budget < 0 {
+		return false, false
+	}
+	v, _ = v.Unmark()
+	if !v.IsKnown() {
+		return false, true
+	}
+	if v.IsNull() {
+		return true, true
+	}
+	ty := v.Type()
+	if !ty.IsCollectionType() && !ty.IsObjectType() && !ty.IsTupleType() {
+		return true, true
+	}
+	for it := v.ElementIterator(); it.Next(); {
+		_, e := it.Element()
+		if known, ok := wholeKnownWithin(e, budget); !known || !ok {
+			return known, ok
+		}
+	}
+	return true, true
+}
 
 // forIterations estimates how many iterations the for expressions of expr
 // run: for nested ones, the product of their collection lengths. A
@@ -730,6 +1067,21 @@ func (ev *Evaluator) configuredAttribute(typeName, name, attr string) cty.Value 
 	if ev.host == nil || ev.host.Attribute == nil {
 		return cty.DynamicVal
 	}
+	key := "resource " + typeName + "." + name + "." + attr
+	if v, ok := ev.configured[key]; ok {
+		return v
+	}
+	if ev.evaluating[key] {
+		return cty.DynamicVal
+	}
+	ev.evaluating[key] = true
+	v := ev.configuredAttributeUncached(typeName, name, attr)
+	delete(ev.evaluating, key)
+	ev.configured[key] = v
+	return v
+}
+
+func (ev *Evaluator) configuredAttributeUncached(typeName, name, attr string) cty.Value {
 	info, ok := ev.host.Attribute("resource", typeName, attr)
 	if !ok || info.Computed {
 		// a provider may plan another value for an optional and
@@ -741,16 +1093,10 @@ func (ev *Evaluator) configuredAttribute(typeName, name, attr string) cty.Value 
 		return cty.DynamicVal
 	}
 	a, ok := block.Body.Attributes[attr]
-	if !ok {
+	if !ok || ignoresChanges(block, attr) {
 		return cty.DynamicVal
 	}
-	key := "resource " + typeName + "." + name + "." + attr
-	if ev.evaluating[key] {
-		return cty.DynamicVal
-	}
-	ev.evaluating[key] = true
 	r := ev.Eval(a.Expr, nil)
-	delete(ev.evaluating, key)
 	if !r.IsKnown() {
 		return cty.DynamicVal
 	}
@@ -758,6 +1104,47 @@ func (ev *Evaluator) configuredAttribute(typeName, name, attr string) cty.Value 
 		return r.Value.Mark(SensitiveMark)
 	}
 	return r.Value
+}
+
+// ignoresChanges reports whether the lifecycle block of a resource lists
+// the argument attr in ignore_changes, or ignores all changes. After the
+// first apply, OpenTofu then keeps the argument's value from the state,
+// whatever the configuration says. An ignore_changes it cannot read
+// counts as ignoring everything.
+func ignoresChanges(block *hclsyntax.Block, attr string) bool {
+	for _, b := range block.Body.Blocks {
+		if b.Type != "lifecycle" {
+			continue
+		}
+		a, ok := b.Body.Attributes["ignore_changes"]
+		if !ok {
+			continue
+		}
+		if t, diags := hcl.AbsTraversalForExpr(a.Expr); !diags.HasErrors() && len(t) == 1 && t.RootName() == "all" {
+			return true
+		}
+		tuple, ok := a.Expr.(*hclsyntax.TupleConsExpr)
+		if !ok {
+			return true
+		}
+		for _, item := range tuple.Exprs {
+			if t, diags := hcl.AbsTraversalForExpr(item); !diags.HasErrors() {
+				if t.RootName() == attr {
+					return true
+				}
+				continue
+			}
+			// the legacy quoted form, such as "tags" or "tags.Name"
+			v, diags := item.Value(nil)
+			if diags.HasErrors() || !v.IsKnown() || v.IsNull() || v.Type() != cty.String {
+				return true
+			}
+			if s := v.AsString(); s == attr || strings.HasPrefix(s, attr+".") || strings.HasPrefix(s, attr+"[") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // moduleValue builds the module object for the module calls that the
@@ -823,8 +1210,8 @@ func (ev *Evaluator) evalModuleOutputs(name string) (map[string]Result, bool) {
 			continue
 		}
 		r := child.Eval(o.expr, nil)
-		if o.sensitive && r.IsKnown() {
-			r.Value = r.Value.Mark(SensitiveMark)
+		if r.IsKnown() {
+			r.Value = o.mark(r.Value)
 		}
 		outs[outName] = r
 	}
@@ -869,10 +1256,7 @@ func (ev *Evaluator) evalModuleInstances(name string) (cty.Value, bool) {
 			val := cty.DynamicVal
 			if o.expr != nil {
 				if r := child.Eval(o.expr, nil); r.IsKnown() {
-					val = r.Value
-					if o.sensitive {
-						val = val.Mark(SensitiveMark)
-					}
+					val = o.mark(r.Value)
 				}
 			}
 			vals[outName] = val
@@ -946,9 +1330,10 @@ func (ev *Evaluator) unknownCause(expr hcl.Expression, ctx *hcl.EvalContext) (Re
 			call, _ := attrStep(t, 1)
 			out, _ := attrStep(t, 2)
 			if r, ok := ev.moduleOutputs[call][out]; ok && !r.IsKnown() {
-				if r.Kind == NotEvaluated {
+				if r.Kind == NotEvaluated || r.Kind == Rejected {
 					// the child's own reason, such as an unsupported function
-					return Result{Kind: NotEvaluated, Reason: r.Reason}, true
+					// or a value that fails validation
+					return Result{Kind: r.Kind, Reason: r.Reason}, true
 				}
 				return Result{Kind: r.Kind, Reason: TraversalString(t), Detail: r.Detail}, true
 			}
@@ -979,6 +1364,9 @@ func (ev *Evaluator) unknownCause(expr hcl.Expression, ctx *hcl.EvalContext) (Re
 		if t.RootName() == "data" {
 			return ev.dataCause(t), true
 		}
+		if ev.ignoredChange(t) {
+			return Result{Kind: FromState, Reason: TraversalString(t)}, true
+		}
 		return Result{Kind: AfterApply, Reason: TraversalString(t)}, true
 	}
 
@@ -1004,6 +1392,24 @@ func (ev *Evaluator) unknownCause(expr hcl.Expression, ctx *hcl.EvalContext) (Re
 		return Result{Kind: AtPlan, Reason: atPlan + "()"}, true
 	}
 	return Result{}, false
+}
+
+// ignoredChange reports whether t refers to a configured argument of a
+// resource whose lifecycle ignore_changes lists it.
+func (ev *Evaluator) ignoredChange(t hcl.Traversal) bool {
+	name, ok1 := attrStep(t, 1)
+	attr, ok2 := attrStep(t, 2)
+	if !ok1 || !ok2 {
+		return false
+	}
+	if _, ok := t[2].(hcl.TraverseAttr); !ok {
+		return false
+	}
+	block := ev.findBlock("resource", t.RootName(), name)
+	if block == nil || block.Body.Attributes[attr] == nil {
+		return false
+	}
+	return ignoresChanges(block, attr)
 }
 
 // dataCause says when the data source that t refers to is read: during
@@ -1032,13 +1438,21 @@ func (ev *Evaluator) dataCause(t hcl.Traversal) Result {
 // other kind is the result of an argument that is not known statically.
 func (ev *Evaluator) DataReadTiming(typeName, name string) Result {
 	addr := "data." + typeName + "." + name
+	if r, ok := ev.dataTiming[addr]; ok {
+		return r
+	}
 	block := ev.findBlock("data", typeName, name)
 	if block == nil || ev.readingData[addr] {
 		return Result{Kind: AtPlan}
 	}
 	ev.readingData[addr] = true
-	defer delete(ev.readingData, addr)
+	r := ev.dataReadTiming(block, addr)
+	delete(ev.readingData, addr)
+	ev.dataTiming[addr] = r
+	return r
+}
 
+func (ev *Evaluator) dataReadTiming(block *hclsyntax.Block, addr string) Result {
 	if attr, ok := block.Body.Attributes["depends_on"]; ok {
 		for _, dep := range attr.Expr.Variables() {
 			switch dep.RootName() {
@@ -1122,7 +1536,7 @@ func attrStep(t hcl.Traversal, i int) (string, bool) {
 	case hcl.TraverseAttr:
 		return s.Name, true
 	case hcl.TraverseIndex:
-		if s.Key.Type() == cty.String && s.Key.IsKnown() {
+		if s.Key.Type() == cty.String && s.Key.IsKnown() && !s.Key.IsNull() && !s.Key.IsMarked() {
 			return s.Key.AsString(), true
 		}
 	}

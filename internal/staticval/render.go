@@ -14,22 +14,61 @@ import (
 const (
 	unknownText   = "(known after apply)"
 	sensitiveText = "(sensitive)"
+	ephemeralText = "(ephemeral value)"
 )
+
+// redactedText is what is shown instead of a marked value: "(ephemeral
+// value)", as tofu console prints it, when any part is ephemeral, and
+// "(sensitive)" otherwise.
+func redactedText(v cty.Value) string {
+	if _, marks := v.UnmarkDeep(); marks.Has(EphemeralMark) {
+		return ephemeralText
+	}
+	return sensitiveText
+}
+
+// textBuilder is a strings.Builder that stops taking text once it holds
+// limit bytes (0 means no limit), so that rendering a huge value costs no
+// more than the part that is shown.
+type textBuilder struct {
+	strings.Builder
+	limit int
+}
+
+func (b *textBuilder) full() bool {
+	return b.limit > 0 && b.Len() >= b.limit
+}
 
 // FormatValue renders a value as HCL, over several lines when it does not
 // fit on one. Unknown parts render as "(known after apply)" and sensitive
 // parts as "(sensitive)", so the text never shows a secret.
 func FormatValue(v cty.Value) string {
-	var b strings.Builder
+	var b textBuilder
 	writeValue(&b, v, "")
 	return b.String()
 }
 
+// maxRenderBytes bounds the text rendered for a hover value: more than
+// maxValueChars runes of text, so capValueText still has the lines it
+// keeps, but not the whole of a value with millions of elements.
+const maxRenderBytes = 4*maxValueChars + 1024
+
+// formatValueCapped is FormatValue that stops after maxRenderBytes and
+// reports whether it did.
+func formatValueCapped(v cty.Value) (string, bool) {
+	b := textBuilder{limit: maxRenderBytes}
+	writeValue(&b, v, "")
+	return b.String(), b.full()
+}
+
 const inlineWidth = 60
 
-func writeValue(b *strings.Builder, v cty.Value, indent string) {
+func writeValue(b *textBuilder, v cty.Value, indent string) {
+	if b.full() {
+		return
+	}
 	if v.IsMarked() {
-		b.WriteString(sensitiveText)
+		b.WriteString(redactedText(v))
 		return
 	}
 	if !v.IsKnown() {
@@ -47,14 +86,14 @@ func writeValue(b *strings.Builder, v cty.Value, indent string) {
 		if strings.Contains(strings.TrimSuffix(s, "\n"), "\n") && writeHeredoc(b, s, indent) {
 			return
 		}
-		b.WriteString(quoteString(s))
+		writeQuoted(b, s)
 		return
 	case ty.IsPrimitiveType():
 		b.WriteString(formatPrimitive(v))
 		return
 	}
 
-	if one := formatOneLine(v); utf8.RuneCountInString(one)+len(indent) <= inlineWidth && !strings.Contains(one, "\n") && !hasNested(v) {
+	if one, cut := formatOneLineLimit(v, 4*inlineWidth+16); !cut && utf8.RuneCountInString(one)+len(indent) <= inlineWidth && !strings.Contains(one, "\n") && !hasNested(v) {
 		b.WriteString(one)
 		return
 	}
@@ -67,7 +106,7 @@ func writeValue(b *strings.Builder, v cty.Value, indent string) {
 			return
 		}
 		b.WriteString("[\n")
-		for it := v.ElementIterator(); it.Next(); {
+		for it := v.ElementIterator(); it.Next() && !b.full(); {
 			_, e := it.Element()
 			b.WriteString(inner)
 			writeValue(b, e, inner)
@@ -80,19 +119,24 @@ func writeValue(b *strings.Builder, v cty.Value, indent string) {
 			b.WriteString("{}")
 			return
 		}
-		keys := make([]string, 0, v.LengthInt())
-		width := 0
+		// Keys align to the longest one among those that can be shown.
+		keys := make([]string, 0, min(v.LengthInt(), 1024))
+		width, keyBytes := 0, 0
 		for it := v.ElementIterator(); it.Next(); {
+			if b.limit > 0 && keyBytes > b.limit {
+				break
+			}
 			k, _ := it.Element()
 			key := formatKey(k.AsString())
 			keys = append(keys, key)
+			keyBytes += len(key)
 			if n := utf8.RuneCountInString(key); n > width {
 				width = n
 			}
 		}
 		b.WriteString("{\n")
 		i := 0
-		for it := v.ElementIterator(); it.Next(); {
+		for it := v.ElementIterator(); it.Next() && i < len(keys) && !b.full(); {
 			_, e := it.Element()
 			key := keys[i]
 			i++
@@ -138,7 +182,7 @@ func hasNested(v cty.Value) bool {
 // heredoc always ends with a newline, <<- strips the indentation that
 // its lines share, and a line holding only the delimiter ends it, so
 // strings that differ in any of these ways are left to quoteString.
-func writeHeredoc(b *strings.Builder, s, indent string) bool {
+func writeHeredoc(b *textBuilder, s, indent string) bool {
 	if !strings.HasSuffix(s, "\n") || strings.Contains(s, "\r") {
 		return false
 	}
@@ -175,6 +219,9 @@ func writeHeredoc(b *strings.Builder, s, indent string) bool {
 	}
 	b.WriteString("<<-" + delim + "\n")
 	for _, line := range lines {
+		if b.full() {
+			return true
+		}
 		if line != "" {
 			// a heredoc is a template: escape interpolation markers
 			line = strings.ReplaceAll(line, "${", "$${")
@@ -189,14 +236,25 @@ func writeHeredoc(b *strings.Builder, s, indent string) bool {
 
 // formatOneLine renders a value on a single line.
 func formatOneLine(v cty.Value) string {
-	var b strings.Builder
+	var b textBuilder
 	writeOneLine(&b, v)
 	return b.String()
 }
 
-func writeOneLine(b *strings.Builder, v cty.Value) {
+// formatOneLineLimit is formatOneLine that stops after about limit bytes
+// and reports whether it did.
+func formatOneLineLimit(v cty.Value, limit int) (string, bool) {
+	b := textBuilder{limit: limit}
+	writeOneLine(&b, v)
+	return b.String(), b.full()
+}
+
+func writeOneLine(b *textBuilder, v cty.Value) {
+	if b.full() {
+		return
+	}
 	if v.IsMarked() {
-		b.WriteString(sensitiveText)
+		b.WriteString(redactedText(v))
 		return
 	}
 	if !v.IsKnown() {
@@ -210,13 +268,13 @@ func writeOneLine(b *strings.Builder, v cty.Value) {
 	ty := v.Type()
 	switch {
 	case ty == cty.String:
-		b.WriteString(quoteString(v.AsString()))
+		writeQuoted(b, v.AsString())
 	case ty.IsPrimitiveType():
 		b.WriteString(formatPrimitive(v))
 	case ty.IsListType() || ty.IsSetType() || ty.IsTupleType():
 		b.WriteString("[")
 		i := 0
-		for it := v.ElementIterator(); it.Next(); {
+		for it := v.ElementIterator(); it.Next() && !b.full(); {
 			_, e := it.Element()
 			if i > 0 {
 				b.WriteString(", ")
@@ -232,7 +290,7 @@ func writeOneLine(b *strings.Builder, v cty.Value) {
 		}
 		b.WriteString("{ ")
 		i := 0
-		for it := v.ElementIterator(); it.Next(); {
+		for it := v.ElementIterator(); it.Next() && !b.full(); {
 			k, e := it.Element()
 			if i > 0 {
 				b.WriteString(", ")
@@ -253,8 +311,9 @@ func writeOneLine(b *strings.Builder, v cty.Value) {
 // fit keep their first elements and say how many are left out; long
 // strings are cut with an ellipsis.
 func FormatCompact(v cty.Value, max int) string {
-	full := formatOneLine(v)
-	if utf8.RuneCountInString(full) <= max {
+	limit := 4*max + 16
+	full, cut := formatOneLineLimit(v, limit)
+	if !cut && utf8.RuneCountInString(full) <= max {
 		return full
 	}
 	if v.IsMarked() || !v.IsKnown() || v.IsNull() {
@@ -263,7 +322,10 @@ func FormatCompact(v cty.Value, max int) string {
 	ty := v.Type()
 	switch {
 	case ty.IsListType() || ty.IsSetType() || ty.IsTupleType():
-		return compactSeq(v, max, "[", "]", func(_ cty.Value, e cty.Value) string { return formatOneLine(e) })
+		return compactSeq(v, max, "[", "]", func(_ cty.Value, e cty.Value) string {
+			s, _ := formatOneLineLimit(e, limit)
+			return s
+		})
 	case ty.IsMapType() || ty.IsObjectType():
 		return compactSeq(v, max, "{ ", " }", func(k cty.Value, _ cty.Value) string { return formatKey(k.AsString()) + " = …" })
 	case ty == cty.String:
@@ -337,9 +399,19 @@ func formatPrimitive(v cty.Value) string {
 
 // quoteString renders a string as an HCL quoted template literal.
 func quoteString(s string) string {
-	var b strings.Builder
+	var b textBuilder
+	writeQuoted(&b, s)
+	return b.String()
+}
+
+// writeQuoted writes s as an HCL quoted template literal, stopping early
+// when b is full.
+func writeQuoted(b *textBuilder, s string) {
 	b.WriteByte('"')
 	for i, r := range s {
+		if b.full() {
+			return
+		}
 		switch r {
 		case '"':
 			b.WriteString(`\"`)
@@ -361,7 +433,6 @@ func quoteString(s string) string {
 		}
 	}
 	b.WriteByte('"')
-	return b.String()
 }
 
 func formatKey(k string) string {
