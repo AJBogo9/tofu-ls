@@ -131,6 +131,14 @@ func TestOriginKindAndSuffix(t *testing.T) {
 			if got := nonUseSuffix(kinds); got != tc.want {
 				t.Fatalf("expected %q, got %q", tc.want, got)
 			}
+			// the syntax agrees that var.x is not used
+			if got := checkedNonUseSuffix(kinds, "var.x", func() map[string]bool { return map[string]bool{"var.x": true} }); got != tc.want {
+				t.Fatalf("checked: expected %q, got %q", tc.want, got)
+			}
+			// the syntax has a use the decoder did not see: no suffix
+			if got := checkedNonUseSuffix(kinds, "var.x", func() map[string]bool { return map[string]bool{} }); got != "" {
+				t.Fatalf("checked with a use in the syntax: expected no suffix, got %q", got)
+			}
 		})
 	}
 }

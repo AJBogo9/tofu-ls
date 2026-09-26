@@ -40,5 +40,5 @@ func (svc *service) References(ctx context.Context, params lsp.ReferenceParams) 
 	}
 	origins := svc.decoder.ReferenceOriginsTargetingPos(path, doc.Filename, pos)
 
-	return ilsp.RefOriginsToLocations(origins), nil
+	return ilsp.RefOriginsToLocationsInText(origins, svc.fs.ReadFile), nil
 }

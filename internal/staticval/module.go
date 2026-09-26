@@ -295,7 +295,14 @@ func AddCallers(fsys FS, mod *Module, nesting int, indexed func(dir string) []Ca
 	}
 	callers := LocalCallers(fsys, mod.Path, maxCallerDepth)
 	if indexed != nil {
-		callers = append(callers, indexed(mod.Path)...)
+		for _, c := range indexed(mod.Path) {
+			if isBelow(c.Parent.Path, mod.Path) {
+				// examples/basic calling "../../" runs the module as a
+				// child for its example; the module is still a root
+				continue
+			}
+			callers = append(callers, c)
+		}
 	}
 	if nesting <= 0 {
 		// Too deep to resolve the callers, but a called module is still a
@@ -333,6 +340,12 @@ func AddCallers(fsys FS, mod *Module, nesting int, indexed func(dir string) []Ca
 			mod.RootPath = parent.RootPath
 		}
 	}
+}
+
+// isBelow reports whether dir is a subdirectory of parent.
+func isBelow(dir, parent string) bool {
+	rel, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(dir))
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // LocalCallers returns the module blocks of dir's ancestor directories (up

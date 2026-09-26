@@ -7,8 +7,10 @@ package lsp
 
 import (
 	"bytes"
+	"unicode/utf8"
 
 	"github.com/hashicorp/hcl-lang/lang"
+	"github.com/hashicorp/hcl/v2"
 	"github.com/opentofu/tofu-ls/internal/lsp/semtok"
 	lsp "github.com/opentofu/tofu-ls/internal/protocol"
 	"github.com/opentofu/tofu-ls/internal/source"
@@ -70,14 +72,14 @@ func (te *TokenEncoder) encodeTokenOfIndex(i int) []uint32 {
 		// But if both, the previous token (its start and end) and the current token are on the same line, we want
 		// to use the previous token start marker to be able to correctly indicate the current token deltaStartChar.
 		if currentLine == previousLine && previousTokenStartLine == previousLine {
-			previousStartChar = te.Tokens[te.lastEncodedTokenIdx].Range.Start.Column - 1
+			previousStartChar = te.char(te.Tokens[te.lastEncodedTokenIdx].Range.Start)
 		}
 	}
 
 	if tokenLineDelta == 0 || false /* te.clientCaps.MultilineTokenSupport */ {
 		deltaLine := token.Range.Start.Line - 1 - previousLine
-		tokenLength := token.Range.End.Byte - token.Range.Start.Byte
-		deltaStartChar := token.Range.Start.Column - 1 - previousStartChar
+		tokenLength := te.char(token.Range.End) - te.char(token.Range.Start)
+		deltaStartChar := te.char(token.Range.Start) - previousStartChar
 
 		data = append(data, []uint32{
 			uint32(deltaLine),
@@ -93,14 +95,14 @@ func (te *TokenEncoder) encodeTokenOfIndex(i int) []uint32 {
 
 			deltaStartChar := 0
 			if tokenLine == token.Range.Start.Line-1 {
-				deltaStartChar = token.Range.Start.Column - 1 - previousStartChar
+				deltaStartChar = te.char(token.Range.Start) - previousStartChar
 			}
 
 			lineBytes := bytes.TrimRight(te.Lines[tokenLine].Bytes, "\n\r")
-			length := len(lineBytes)
+			length := utf16Len(lineBytes)
 
 			if tokenLine == token.Range.End.Line-1 {
-				length = token.Range.End.Column - 1
+				length = te.char(token.Range.End)
 			}
 
 			data = append(data, []uint32{
@@ -118,6 +120,36 @@ func (te *TokenEncoder) encodeTokenOfIndex(i int) []uint32 {
 	te.lastEncodedTokenIdx = i
 
 	return data
+}
+
+// char returns the character of pos in its line in UTF-16 code units, as
+// LSP counts it, from the byte offset. HCL counts columns in grapheme
+// clusters, which differ on lines with emoji or combining marks. It falls
+// back to the column when the lines do not hold the position.
+func (te *TokenEncoder) char(pos hcl.Pos) int {
+	line := pos.Line - 1
+	if line < 0 || line >= len(te.Lines) {
+		return pos.Column - 1
+	}
+	offset := pos.Byte - te.Lines[line].Range.Start.Byte
+	if offset < 0 || offset > len(te.Lines[line].Bytes) {
+		return pos.Column - 1
+	}
+	return utf16Len(te.Lines[line].Bytes[:offset])
+}
+
+func utf16Len(b []byte) int {
+	n := 0
+	for len(b) > 0 {
+		r, size := utf8.DecodeRune(b)
+		b = b[size:]
+		if r >= 0x10000 {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
 }
 
 func (te *TokenEncoder) resolveTokenType(token lang.SemanticToken) (semtok.TokenType, bool) {

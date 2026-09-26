@@ -26,3 +26,27 @@ func RefOriginsToLocations(origins decoder.ReferenceOrigins) []lsp.Location {
 
 	return locations
 }
+
+// RefOriginsToLocationsInText is RefOriginsToLocations, counting the
+// characters of each range in UTF-16 code units of the origin's file, as
+// LSP requires. readFile reads a file by its path, each file once.
+func RefOriginsToLocationsInText(origins decoder.ReferenceOrigins, readFile func(path string) ([]byte, error)) []lsp.Location {
+	locations := make([]lsp.Location, len(origins))
+	texts := make(map[string][]byte)
+
+	for i, origin := range origins {
+		path := filepath.Join(origin.Path.Path, origin.Range.Filename)
+		text, ok := texts[path]
+		if !ok {
+			// without the text, the range falls back to columns
+			text, _ = readFile(path)
+			texts[path] = text
+		}
+		locations[i] = lsp.Location{
+			URI:   lsp.DocumentURI(uri.FromPath(path)),
+			Range: HCLRangeToLSPInText(origin.Range, text),
+		}
+	}
+
+	return locations
+}
