@@ -41,16 +41,23 @@ func (rl *rpcLogger) LogResponse(ctx context.Context, rsp *jrpc2.Response) {
 		idStr = fmt.Sprintf(" (ID %s)", rsp.ID())
 	}
 
-	req := jrpc2.InboundRequest(ctx)
-	if req.IsNotification() {
-		idStr = " (notification)"
+	// jrpc2 answers a message it could not accept as a request, such as
+	// a client's late reply to a callback, with no context
+	method := ""
+	if ctx != nil {
+		if req := jrpc2.InboundRequest(ctx); req != nil {
+			method = req.Method()
+			if req.IsNotification() {
+				idStr = " (notification)"
+			}
+		}
 	}
 
 	if rsp.Error() != nil {
-		rl.logger.Printf("Error for %q%s: %s", req.Method(), idStr, rsp.Error())
+		rl.logger.Printf("Error for %q%s: %s", method, idStr, rsp.Error())
 		return
 	}
 	var body json.RawMessage
 	rsp.UnmarshalResult(&body)
-	rl.logger.Printf("Response to %q%s: %s", req.Method(), idStr, body)
+	rl.logger.Printf("Response to %q%s: %s", method, idStr, body)
 }

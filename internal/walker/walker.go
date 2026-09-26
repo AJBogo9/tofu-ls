@@ -35,6 +35,8 @@ var (
 		".vscode":             true,
 		"terraform.tfstate.d": true,
 		".terragrunt-cache":   true,
+		"node_modules":        true,
+		".vscode-test":        true,
 	}
 )
 

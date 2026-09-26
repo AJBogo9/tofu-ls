@@ -81,12 +81,32 @@ func (svc *service) scheduleInlayHintRefresh() {
 	}
 	svc.inlayRefreshMu.Lock()
 	defer svc.inlayRefreshMu.Unlock()
+	if svc.inlayRefreshStopped {
+		// shutting down: a refresh sent after exit would be answered
+		// by a client that is gone
+		return
+	}
 	if svc.inlayRefresh != nil {
 		svc.inlayRefresh.Stop()
 	}
 	svc.inlayRefresh = time.AfterFunc(inlayHintRefreshDelay, func() {
+		if svc.sessCtx.Err() != nil {
+			return
+		}
 		if _, err := svc.server.Callback(svc.sessCtx, "workspace/inlayHint/refresh", nil); err != nil {
 			svc.logger.Printf("refreshing inlay hints: %s", err)
 		}
 	})
+}
+
+// stopInlayHintRefresh stops a pending inlay hint refresh for good, on
+// shutdown.
+func (svc *service) stopInlayHintRefresh() {
+	svc.inlayRefreshMu.Lock()
+	defer svc.inlayRefreshMu.Unlock()
+	svc.inlayRefreshStopped = true
+	if svc.inlayRefresh != nil {
+		svc.inlayRefresh.Stop()
+		svc.inlayRefresh = nil
+	}
 }

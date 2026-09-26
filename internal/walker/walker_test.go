@@ -72,3 +72,29 @@ func testLogger() *log.Logger {
 
 	return log.New(io.Discard, "", 0)
 }
+
+func TestWalker_isSkippableDir(t *testing.T) {
+	w := NewWalker(nil, nil, nil)
+
+	testCases := []struct {
+		name string
+		skip bool
+	}{
+		{".git", true},
+		{".terragrunt-cache", true},
+		// JavaScript tooling next to a configuration, e.g. a CDK or an
+		// editor extension checkout, holds tens of thousands of dirs
+		{"node_modules", true},
+		{".vscode-test", true},
+		{"modules", false},
+		{".terraform", false},
+		{"node_modules_backup", false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := w.isSkippableDir(tc.name); got != tc.skip {
+				t.Fatalf("expected skip=%t for %q, got %t", tc.skip, tc.name, got)
+			}
+		})
+	}
+}

@@ -7,10 +7,13 @@ import (
 	"context"
 
 	"github.com/hashicorp/hcl-lang/lang"
+	"github.com/hashicorp/hcl-lang/reference"
 	"github.com/hashicorp/hcl/v2"
+	"github.com/opentofu/tofu-ls/internal/features/modules/ast"
 	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 	lsp "github.com/opentofu/tofu-ls/internal/protocol"
 	"github.com/opentofu/tofu-ls/internal/refactor"
+	globalAst "github.com/opentofu/tofu-ls/internal/tofu/ast"
 )
 
 // DocumentHighlight highlights the symbol under the cursor in the current
@@ -57,7 +60,12 @@ func (svc *service) DocumentHighlight(ctx context.Context, params lsp.DocumentHi
 	}
 
 	for _, target := range targets {
-		nameRng, hasName := refactor.DeclarationNameRange(svc.refactorEnv(), target.Path, target.Target)
+		inThisFile := target.Path.Equals(path) && target.Target.RangePtr.Filename == doc.Filename
+		var nameRng hcl.Range
+		var hasName bool
+		if !onReference || inThisFile {
+			nameRng, hasName = svc.declarationNameRange(target.Path, target.Target)
+		}
 		if !onReference {
 			// Only the declared name highlights its symbol: on a keyword
 			// or inside the body, the editor's word highlight is better.
@@ -69,7 +77,7 @@ func (svc *service) DocumentHighlight(ctx context.Context, params lsp.DocumentHi
 			}
 		}
 
-		if target.Path.Equals(path) && target.Target.RangePtr.Filename == doc.Filename {
+		if inThisFile {
 			if hasName {
 				add(nameRng, lsp.Write)
 			} else if target.Target.DefRangePtr != nil {
@@ -77,9 +85,11 @@ func (svc *service) DocumentHighlight(ctx context.Context, params lsp.DocumentHi
 			}
 		}
 
-		for _, origin := range svc.decoder.OriginsTargeting(ctx, target.Target, target.Path) {
+		// Only this module can hold uses in this file, so no other
+		// module is read.
+		for _, origin := range svc.decoder.OriginsTargetingInPath(target.Target, target.Path, path) {
 			rng := origin.Origin.OriginRange()
-			if origin.Path.Equals(path) && rng.Filename == doc.Filename {
+			if rng.Filename == doc.Filename {
 				add(rng, lsp.Read)
 			}
 		}
@@ -89,4 +99,25 @@ func (svc *service) DocumentHighlight(ctx context.Context, params lsp.DocumentHi
 		return nil, nil
 	}
 	return highlights, nil
+}
+
+// declarationNameRange is refactor.DeclarationNameRange, but it takes
+// the declaring file from the module's index, which already parsed it,
+// instead of reading and parsing it again on every cursor move.
+func (svc *service) declarationNameRange(path lang.Path, target reference.Target) (hcl.Range, bool) {
+	if target.RangePtr != nil && svc.features != nil && svc.features.Modules != nil {
+		mod, err := svc.features.Modules.Store.ModuleRecordByPath(path.Path)
+		if err == nil {
+			name := ast.ModFilename(target.RangePtr.Filename)
+			if f, ok := mod.ParsedModuleFiles[name]; ok {
+				if mod.ModuleDiagnostics[globalAst.HCLParsingSource][name].HasErrors() {
+					// as refactor.DeclarationNameRange, which refuses
+					// a file with syntax errors
+					return hcl.Range{}, false
+				}
+				return refactor.DeclarationNameRangeInFile(path, target, f)
+			}
+		}
+	}
+	return refactor.DeclarationNameRange(svc.refactorEnv(), path, target)
 }

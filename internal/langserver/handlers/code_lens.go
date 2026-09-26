@@ -33,6 +33,8 @@ func (svc *service) TextDocumentCodeLens(ctx context.Context, params lsp.CodeLen
 		LanguageID: string(ilsp.ParseLanguageID(doc.LanguageID)),
 	}
 
+	svc.decodeCallersForLenses(ctx, path)
+
 	lenses, err := svc.decoder.CodeLensesForFile(ctx, path, doc.Filename)
 	if err != nil {
 		return nil, err
@@ -52,4 +54,25 @@ func (svc *service) TextDocumentCodeLens(ctx context.Context, params lsp.CodeLen
 	}
 
 	return list, nil
+}
+
+// decodeCallersForLenses decodes the modules which call the module of
+// path, so that a reference count lens counts the uses in its callers
+// from the first request, as the Find References that a click on it
+// sends lists them (References decodes the whole workspace).
+func (svc *service) decodeCallersForLenses(ctx context.Context, path lang.Path) {
+	if svc.features == nil || svc.features.Modules == nil || ilsp.ParseLanguageID(path.LanguageID) != ilsp.OpenTofu {
+		return
+	}
+	cc, err := ilsp.ClientCapabilities(ctx)
+	if err != nil {
+		return
+	}
+	if _, ok := lsp.ExperimentalClientCapabilities(cc.Experimental).ShowReferencesCommandId(); !ok {
+		// no reference count lenses
+		return
+	}
+	if err := svc.features.Modules.DecodeCallersOf(ctx, path.Path); err != nil {
+		svc.logger.Printf("decoding the callers of %q for lenses: %s", path.Path, err)
+	}
 }

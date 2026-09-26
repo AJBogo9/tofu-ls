@@ -15,6 +15,7 @@ import (
 	"github.com/opentofu/opentofu-schema/registry"
 	tfschema "github.com/opentofu/opentofu-schema/schema"
 	tfaddr "github.com/opentofu/registry-address"
+	"github.com/opentofu/tofu-ls/internal/decoder/refcache"
 	"github.com/opentofu/tofu-ls/internal/features/modules/state"
 	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 )
@@ -43,9 +44,14 @@ type CombinedReader struct {
 type PathReader struct {
 	RootReader  RootReader
 	StateReader StateReader
+
+	// ReferenceCache, when set, keeps the reference contexts of modules
+	// across calls of ReferencePathContext.
+	ReferenceCache *refcache.Cache[state.ModuleRecord]
 }
 
 var _ decoder.PathReader = &PathReader{}
+var _ decoder.ReferencePathReader = &PathReader{}
 
 func (pr *PathReader) Paths(ctx context.Context) []lang.Path {
 	paths := make([]lang.Path, 0)
@@ -75,4 +81,16 @@ func (pr *PathReader) PathContext(path lang.Path) (*decoder.PathContext, error) 
 		StateReader: pr.StateReader,
 		RootReader:  pr.RootReader,
 	})
+}
+
+// ReferencePathContext returns the reference origins and targets and the
+// files of the module, without its schema, for reference lookups across
+// modules (see decoder.ReferencePathReader).
+func (pr *PathReader) ReferencePathContext(path lang.Path) (*decoder.PathContext, error) {
+	mod, err := pr.StateReader.ModuleRecordByPath(path.Path)
+	if err != nil {
+		pr.ReferenceCache.Forget(path.Path)
+		return nil, err
+	}
+	return pr.ReferenceCache.Get(path.Path, mod, moduleReferenceContext), nil
 }

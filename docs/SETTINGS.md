@@ -87,6 +87,8 @@ The following list of directories will always be ignored:
 - `.vscode`
 - `terraform.tfstate.d`
 - `.terragrunt-cache`
+- `node_modules`
+- `.vscode-test`
 
 ## **DEPRECATED**: `ignoreDirectoryNames` (`[]string`)
 

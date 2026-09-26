@@ -75,3 +75,49 @@ func TestScheduleInlayHintRefresh(t *testing.T) {
 		})
 	}
 }
+
+// A refresh posted after the client sent shutdown and exit is answered by
+// a client that is gone, which used to crash the server at exit.
+func TestInlayHintRefresh_stoppedOnShutdown(t *testing.T) {
+	testCases := []struct {
+		name         string
+		editBefore   bool
+		editAfter    bool
+		cancelledCtx bool
+	}{
+		{"edit just before shutdown", true, false, false},
+		{"edit after shutdown", false, true, false},
+		{"edit before and after shutdown", true, true, false},
+		{"session already ended", true, false, true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := &recordingServer{}
+			sessCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			svc := &service{
+				logger:           log.New(io.Discard, "", 0),
+				sessCtx:          sessCtx,
+				server:           srv,
+				inlayHintRefresh: true,
+				inlayHints:       settings.InlayHints{Values: true},
+			}
+			if tc.editBefore {
+				svc.scheduleInlayHintRefresh()
+			}
+			if tc.cancelledCtx {
+				// the timer fires after exit ended the session
+				cancel()
+			} else {
+				svc.shutdown()
+			}
+			if tc.editAfter {
+				svc.scheduleInlayHintRefresh()
+			}
+			time.Sleep(inlayHintRefreshDelay + 300*time.Millisecond)
+			if got := srv.calls(); len(got) != 0 {
+				t.Fatalf("expected no refresh after shutdown, got %q", got)
+			}
+		})
+	}
+}

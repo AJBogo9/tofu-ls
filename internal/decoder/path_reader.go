@@ -22,6 +22,7 @@ type GlobalPathReader struct {
 }
 
 var _ decoder.PathReader = &GlobalPathReader{}
+var _ decoder.ReferencePathReader = &GlobalPathReader{}
 
 func (mr *GlobalPathReader) Paths(ctx context.Context) []lang.Path {
 	paths := make([]lang.Path, 0)
@@ -38,6 +39,18 @@ func (mr *GlobalPathReader) PathContext(path lang.Path) (*decoder.PathContext, e
 	id := lsp.ParseLanguageID(path.LanguageID)
 	if feature, ok := mr.PathReaderMap[id.String()]; ok {
 		return feature.PathContext(path)
+	}
+
+	return nil, fmt.Errorf("no feature found for language %s", path.LanguageID)
+}
+
+// ReferencePathContext returns the context of the path for reference
+// lookups from the language's PathReader, without the schema when that
+// reader implements decoder.ReferencePathReader.
+func (mr *GlobalPathReader) ReferencePathContext(path lang.Path) (*decoder.PathContext, error) {
+	id := lsp.ParseLanguageID(path.LanguageID)
+	if feature, ok := mr.PathReaderMap[id.String()]; ok {
+		return decoder.ReferencePathContext(feature, path)
 	}
 
 	return nil, fmt.Errorf("no feature found for language %s", path.LanguageID)

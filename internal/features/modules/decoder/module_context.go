@@ -37,7 +37,28 @@ func modulePathContext(mod *state.ModuleRecord, stateReader CombinedReader) (*de
 
 		SemanticHighlighting: semanticHighlighting,
 	}
+	addReferencesAndFiles(pathCtx, mod)
 
+	return pathCtx, nil
+}
+
+// moduleReferenceContext returns the part of the module's path context
+// that reference lookups read, with an index of its origins. Unlike
+// modulePathContext it builds no schema, which is costly for modules
+// with large providers.
+func moduleReferenceContext(mod *state.ModuleRecord) *decoder.PathContext {
+	pathCtx := &decoder.PathContext{
+		ReferenceOrigins: make(reference.Origins, 0),
+		ReferenceTargets: make(reference.Targets, 0),
+		Files:            make(map[string]*hcl.File, 0),
+	}
+	addReferencesAndFiles(pathCtx, mod)
+	pathCtx.ReferenceOriginIndex = reference.NewOriginIndex(pathCtx.ReferenceOrigins)
+
+	return pathCtx
+}
+
+func addReferencesAndFiles(pathCtx *decoder.PathContext, mod *state.ModuleRecord) {
 	for _, origin := range mod.RefOrigins {
 		if ast.IsModuleFilename(origin.OriginRange().Filename) {
 			pathCtx.ReferenceOrigins = append(pathCtx.ReferenceOrigins, origin)
@@ -54,6 +75,4 @@ func modulePathContext(mod *state.ModuleRecord, stateReader CombinedReader) (*de
 	for name, f := range mod.ParsedModuleFiles {
 		pathCtx.Files[name.String()] = f
 	}
-
-	return pathCtx, nil
 }

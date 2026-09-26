@@ -231,9 +231,8 @@ output "test" {
 }
 
 func TestCodeLens_referenceCount_crossModule(t *testing.T) {
-	// TODO?
-	t.Skip("We currently fail here because we open the submodule, so we don't process the root one")
-
+	// Only the submodule is open: the lenses count the uses in the root
+	// module, which calls it, as Find References lists them.
 	rootModPath, err := filepath.Abs(filepath.Join("testdata", "single-submodule"))
 	if err != nil {
 		t.Fatal(err)
@@ -330,7 +329,7 @@ variable "instances" {
 						}
 					},
 					"command": {
-						"title": "1 reference",
+						"title": "1 reference (module arguments only)",
 						"command": "test.id",
 						"arguments": [
 							{
@@ -355,7 +354,7 @@ variable "instances" {
 						}
 					},
 					"command": {
-						"title": "1 reference",
+						"title": "1 reference (module arguments only)",
 						"command": "test.id",
 						"arguments": [
 							{
@@ -380,7 +379,7 @@ variable "instances" {
 						}
 					},
 					"command": {
-						"title": "1 reference",
+						"title": "1 reference (module arguments only)",
 						"command": "test.id",
 						"arguments": [
 							{
