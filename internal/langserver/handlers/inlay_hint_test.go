@@ -131,19 +131,27 @@ func TestInlayHint_values(t *testing.T) {
 		expected    string
 	}{
 		{
-			"enabled by default",
+			"informative by default: the local's value instead of a hint inside its template",
 			`{}`,
 			`[
-				{"position": {"line": 7, "character": 25}, "label": [{"value": "= \"prod\""}], "paddingLeft": true},
-				{"position": {"line": 11, "character": 20}, "label": [{"value": "= \"app-prod\""}], "paddingLeft": true}
+				{"position": {"line": 7, "character": 27}, "label": [{"value": "▸ \"app-prod\""}], "paddingLeft": true},
+				{"position": {"line": 11, "character": 20}, "label": [{"value": "▸ \"app-prod\""}], "paddingLeft": true}
+			]`,
+		},
+		{
+			"all",
+			`{"inlayHints": {"valuePolicy": "all"}}`,
+			`[
+				{"position": {"line": 7, "character": 25}, "label": [{"value": "▸ \"prod\""}], "paddingLeft": true},
+				{"position": {"line": 11, "character": 20}, "label": [{"value": "▸ \"app-prod\""}], "paddingLeft": true}
 			]`,
 		},
 		{
 			"max length",
-			`{"inlayHints": {"maxLength": 6}}`,
+			`{"inlayHints": {"maxLength": 6, "valuePolicy": "all"}}`,
 			`[
-				{"position": {"line": 7, "character": 25}, "label": [{"value": "= \"prod\""}], "paddingLeft": true},
-				{"position": {"line": 11, "character": 20}, "label": [{"value": "= \"app…\""}], "paddingLeft": true}
+				{"position": {"line": 7, "character": 25}, "label": [{"value": "▸ \"prod\""}], "paddingLeft": true},
+				{"position": {"line": 11, "character": 20}, "label": [{"value": "▸ \"app…\""}], "paddingLeft": true}
 			]`,
 		},
 		{

@@ -449,7 +449,7 @@ output "o" {
 			}
 		}
 	}
-	if !strings.Contains(strings.Join(got, "|"), `var.fine = "fine-val"`) {
+	if !strings.Contains(strings.Join(got, "|"), "var.fine "+ValueHintPrefix+`"fine-val"`) {
 		t.Errorf("missing the hint for a plain variable: %q", got)
 	}
 }
@@ -644,7 +644,7 @@ func TestEvaluator_boundedWork(t *testing.T) {
 			for _, h := range hints {
 				if h.Ref == "local.big" {
 					n++
-					if want := "= [0, 1, 2, 3, 4, 5, 6, 7, … 999992 more]"; h.Label != want {
+					if want := ValueHintPrefix + "[0, 1, 2, 3, 4, 5, 6, 7, … 999992 more]"; h.Label != want {
 						t.Fatalf("expected %s, got %s", want, h.Label)
 					}
 				}

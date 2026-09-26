@@ -356,6 +356,62 @@ func usedAsRoot(fsys FS, mod *Module) bool {
 	return err == nil && len(entries) > 0
 }
 
+// IsLibraryRoot reports whether a module evaluated as a root is a library
+// module that its callers configure, so that the values its defaults give
+// are placeholders: it has no tfvars files that OpenTofu loads
+// automatically, no backend and no local state, and it has an examples
+// directory or a caller below it (an example or a test that calls "../../").
+// A .terraform directory does not make it a root here: library authors run
+// tofu init too, to validate. indexed is the language server's index of
+// callers, as for AddCallers, and may be nil.
+func IsLibraryRoot(fsys FS, mod *Module, indexed func(dir string) []Caller) bool {
+	if mod.RootPath != "" || len(mod.VarsFiles) > 0 || len(mod.VarsFileErrors) > 0 || mod.hasBackend() {
+		return false
+	}
+	if entries, err := fsys.ReadDir(mod.Path); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() && e.Name() == "terraform.tfstate" {
+				return false
+			}
+		}
+	}
+	// The language server's filesystem lists a missing directory as
+	// empty instead of failing.
+	if entries, err := fsys.ReadDir(filepath.Join(mod.Path, "examples")); err == nil && len(entries) > 0 {
+		return true
+	}
+	if indexed != nil {
+		for _, c := range indexed(mod.Path) {
+			if isBelow(c.Parent.Path, mod.Path) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasBackend reports whether the module configures a backend or cloud
+// block, which only a root module does.
+func (m *Module) hasBackend() bool {
+	for _, f := range m.Files {
+		content, _, _ := f.Body.PartialContent(&hcl.BodySchema{
+			Blocks: []hcl.BlockHeaderSchema{{Type: "terraform"}},
+		})
+		if content == nil {
+			continue
+		}
+		for _, tf := range content.Blocks {
+			inner, _, _ := tf.Body.PartialContent(&hcl.BodySchema{
+				Blocks: []hcl.BlockHeaderSchema{{Type: "backend", LabelNames: []string{"type"}}, {Type: "cloud"}},
+			})
+			if inner != nil && len(inner.Blocks) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // maxCallerDepth is how many directories up AddCallers looks for module
 // blocks that call a module.
 const maxCallerDepth = 4

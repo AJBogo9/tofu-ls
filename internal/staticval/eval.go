@@ -57,6 +57,10 @@ const (
 	// FromState means the value is an argument that lifecycle
 	// ignore_changes keeps at its value in the state.
 	FromState
+	// LibraryDefault means the value depends on a variable that only has
+	// its default, in a library module whose callers set it (see
+	// IsLibraryRoot). Only the informative inlay hints treat defaults so.
+	LibraryDefault
 )
 
 // Result is the outcome of evaluating an expression.
@@ -532,6 +536,31 @@ func (ev *Evaluator) decodeEnvVars() {
 		}
 		v.Assignments = append(v.Assignments, a)
 	}
+}
+
+// hideDefaults makes every variable of a root module whose value is only
+// its default unknown, with LibraryDefault as the cause, and forgets what
+// was computed from the defaults.
+func (ev *Evaluator) hideDefaults() {
+	if ev.mod.RootPath != "" {
+		return
+	}
+	for name, v := range ev.vars {
+		if _, source, ok := v.Effective(); !ok || source != "default" {
+			continue
+		}
+		if _, failed := ev.failures[name]; failed {
+			// already unknown, with the failed validation as the cause
+			continue
+		}
+		ev.varValues[name] = v.markValue(cty.DynamicVal)
+		ev.varCauses[name] = Result{Kind: LibraryDefault, Reason: "var." + name}
+	}
+	ev.localResults = make(map[string]Result)
+	ev.configured = make(map[string]cty.Value)
+	ev.dataTiming = make(map[string]Result)
+	ev.moduleOutputs = make(map[string]map[string]Result)
+	ev.moduleInstances = make(map[string]cty.Value)
 }
 
 // refuse records that OpenTofu refuses to run the root module because the

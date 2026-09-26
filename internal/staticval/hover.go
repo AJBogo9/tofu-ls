@@ -52,6 +52,10 @@ type Hover struct {
 // maxListed caps the instances and inputs listed in one hover.
 const maxListed = 8
 
+// maxModuleHoverItems caps the inputs and the outputs a module call's
+// hover lists. Required inputs are always listed.
+const maxModuleHoverItems = 12
+
 // HoverAt answers a hover at pos in the module file filename (a base
 // name) when the position is on something this package knows more about
 // than the schema: a variable or local reference or declaration, an
@@ -289,7 +293,7 @@ func (ev *Evaluator) variableHover(name string, ref *hclsyntax.ScopeTraversalExp
 		fmt.Fprintf(&b, "```hcl\ntype = %s\n```\n\n", typeBlock)
 	}
 	if v.Description != "" {
-		b.WriteString(v.Description)
+		b.WriteString(shortDescription(v.Description))
 		b.WriteString("\n\n")
 	}
 
@@ -510,7 +514,7 @@ func typeDisplay(v *Variable) (string, string) {
 	if !strings.Contains(src, "\n") && utf8.RuneCountInString(src) <= 40 {
 		return src, ""
 	}
-	return "", dedent(src)
+	return "", shortType(dedent(src))
 }
 
 func (ev *Evaluator) localHover(name string, ref *hclsyntax.ScopeTraversalExpr) (string, bool) {
@@ -628,6 +632,8 @@ func unknownExplanation(r Result) string {
 		return "error: " + r.Reason
 	case FromState:
 		return fmt.Sprintf("unknown: depends on `%s`, and lifecycle.ignore_changes keeps the value from state", r.Reason)
+	case LibraryDefault:
+		return fmt.Sprintf("set by the module's callers: `%s` only has its default here", r.Reason)
 	}
 	return "unknown"
 }
@@ -664,9 +670,10 @@ func valueBlock(label string, v cty.Value, suffix string) string {
 }
 
 // maxValueLines and maxValueChars cap a value shown in a hover, which
-// otherwise can be megabytes (a file() of a large JSON document).
+// otherwise can be megabytes (a file() of a large JSON document). Sixteen
+// lines keep a hover with its value and type or source within about 40.
 const (
-	maxValueLines = 60
+	maxValueLines = 16
 	maxValueChars = 6000
 )
 
@@ -681,7 +688,8 @@ func capValueText(s string, cutShort bool) string {
 	}
 	total := len(lines)
 	cut := 0
-	if len(lines) > maxValueLines {
+	// cutting a line or two to say so on a line of its own saves nothing
+	if len(lines) > maxValueLines+2 {
 		cut = len(lines) - maxValueLines
 		lines = lines[:maxValueLines]
 	}
@@ -719,7 +727,7 @@ func prettyJSON(v cty.Value) (string, bool) {
 	return buf.String(), true
 }
 
-const maxSourceLines = 12
+const maxSourceLines = 8
 const maxSourceChars = 800
 
 // trimSource keeps an expression's source short enough for a hover.
@@ -1479,15 +1487,40 @@ func (ev *Evaluator) moduleCallHover(block *hclsyntax.Block, env Env) string {
 
 	child := ev.newEvaluator(mc.child)
 	names := mapKeys(child.vars)
+	// required inputs first, then those this call sets, then the rest
+	rank := func(name string) int {
+		_, set := block.Body.Attributes[name]
+		switch {
+		case !child.vars[name].HasDefault:
+			return 0
+		case set:
+			return 1
+		}
+		return 2
+	}
 	sort.SliceStable(names, func(i, j int) bool {
-		ri := !child.vars[names[i]].HasDefault
-		rj := !child.vars[names[j]].HasDefault
-		return ri && !rj
+		return rank(names[i]) < rank(names[j])
 	})
 	if len(names) > 0 {
 		b.WriteString("**Inputs**\n\n")
 	}
-	for _, name := range names {
+	for i, name := range names {
+		if i >= maxModuleHoverItems && rank(name) > 0 && len(names) > i+1 {
+			// every required input is listed; the rest is counted
+			setHere := 0
+			for _, rest := range names[i:] {
+				if rank(rest) == 1 {
+					setHere++
+				}
+			}
+			n := len(names) - i
+			fmt.Fprintf(&b, "- … %d more %s", n, plural(n, "input", "inputs"))
+			if setHere > 0 {
+				fmt.Fprintf(&b, ", %d of them set by this call", setHere)
+			}
+			b.WriteString("\n")
+			break
+		}
 		v := child.vars[name]
 		typ, _ := typeDisplay(v)
 		if typ == "" {
@@ -1532,7 +1565,13 @@ func (ev *Evaluator) moduleCallHover(block *hclsyntax.Block, env Env) string {
 	if len(outs) > 0 {
 		b.WriteString("\n**Outputs**\n\n")
 	}
-	for _, name := range mapKeys(outs) {
+	outNames := mapKeys(outs)
+	for i, name := range outNames {
+		if i >= maxModuleHoverItems && len(outNames) > i+1 {
+			n := len(outNames) - i
+			fmt.Fprintf(&b, "- … %d more %s\n", n, plural(n, "output", "outputs"))
+			break
+		}
 		o := outs[name]
 		fmt.Fprintf(&b, "- `%s`", name)
 		if o.sensitive {

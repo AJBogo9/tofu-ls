@@ -95,6 +95,10 @@ type InlayHints struct {
 	Values bool `mapstructure:"values" default:"true"`
 	// MaxLength caps the characters of a value hint.
 	MaxLength int `mapstructure:"maxLength" default:"40"`
+	// ValuePolicy is "informative" (the hints that tell the reader
+	// something, and one hint for a whole count, for_each, conditional,
+	// template or local value) or "all" (a hint after every reference).
+	ValuePolicy string `mapstructure:"valuePolicy" default:"informative"`
 }
 
 // Values chooses the inputs static values are computed with, as a run
