@@ -43,9 +43,13 @@ var replacements = []replacement{
 	{regexp.MustCompile(`^\s{1,2}\[(.*?)\]: (\S+)( ".*?")?\s*$`), ""},
 	// Remove atx-style headers
 	{regexp.MustCompile(`^(\n)?\s{0,}#{1,6}\s+| {0,}(\n)?\s{0,}#{0,} {0,}(\n)?\s{0,}$`), "$1$2$3"},
-	// Remove emphasis (repeat the line to remove double emphasis)
-	{regexp.MustCompile(`([*_]{1,3})([^\t\n\f\r *_].*?[^\t\n\f\r *_]{0,1})([*_]{1,3})`), "$2"},
-	{regexp.MustCompile(`([*_]{1,3})([^\t\n\f\r *_].*?[^\t\n\f\r *_]{0,1})([*_]{1,3})`), "$2"},
+	// Remove emphasis (repeat the line to remove double emphasis). An
+	// underscore inside a word, as in find_in_parent_folders, is not
+	// emphasis (CommonMark).
+	{regexp.MustCompile(`(\*{1,3})([^\t\n\f\r *_].*?[^\t\n\f\r *_]{0,1})(\*{1,3})`), "$2"},
+	{regexp.MustCompile(`(\*{1,3})([^\t\n\f\r *_].*?[^\t\n\f\r *_]{0,1})(\*{1,3})`), "$2"},
+	{regexp.MustCompile(`(^|[^\p{L}\p{N}_])(_{1,3})([^\t\n\f\r *_].*?[^\t\n\f\r *_]{0,1})(_{1,3})([^\p{L}\p{N}_]|$)`), "$1$3$5"},
+	{regexp.MustCompile(`(^|[^\p{L}\p{N}_])(_{1,3})([^\t\n\f\r *_].*?[^\t\n\f\r *_]{0,1})(_{1,3})([^\p{L}\p{N}_]|$)`), "$1$3$5"},
 	// Remove code blocks
 	{regexp.MustCompile("(`{3,})(.*?)(`{3,})"), "$2"},
 	// Remove inline code

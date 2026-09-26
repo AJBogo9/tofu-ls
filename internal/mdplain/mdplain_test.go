@@ -21,6 +21,11 @@ func TestClean(t *testing.T) {
 		{"_foo_", "foo"},
 		{"__foo__", "foo"},
 		{"foo_bar", "foo_bar"},
+		{"find_in_parent_folders", "find_in_parent_folders"},
+		{"`find_in_parent_folders` returns a path", "find_in_parent_folders returns a path"},
+		{"see _mock_outputs_ and `mock_outputs`", "see mock_outputs and mock_outputs"},
+		{"(_foo_)", "(foo)"},
+		{"*foo* and _bar_", "foo and bar"},
 
 		{"*foo*", "foo"},
 		{"**foo**", "foo"},

@@ -55,6 +55,9 @@ type ValidationOptions struct {
 	// InterpolationOnly reports "${...}" templates which only wrap an
 	// expression.
 	InterpolationOnly bool `mapstructure:"interpolationOnly" default:"true"`
+	// Terragrunt reports blocks and attributes of Terragrunt files which
+	// Terragrunt's configuration reference does not have, as warnings.
+	Terragrunt bool `mapstructure:"terragrunt" default:"true"`
 
 	// UnusedSymbols is copied from DiagnosticsOptions, so that it
 	// reaches the module jobs together with the validation options.

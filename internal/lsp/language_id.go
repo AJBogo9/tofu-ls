@@ -16,6 +16,10 @@ const (
 	OpenTofuTest LanguageID = "opentofu-test"
 	// OpenTofuMock is the language of mock data files (*.tfmock.hcl)
 	OpenTofuMock LanguageID = "opentofu-mock"
+	// Terragrunt is the language of terragrunt.hcl and root.hcl
+	Terragrunt LanguageID = "terragrunt"
+	// TerragruntStack is the language of terragrunt.stack.hcl
+	TerragruntStack LanguageID = "terragrunt-stack"
 	// Terraform - Some editors do not support language ID overrides which makes it difficult to use this language server
 	// We also need to accept language IDs of Terraform to circumvent this issue
 	Terraform     LanguageID = "terraform"
@@ -72,6 +76,17 @@ func IsValidTestLanguage(id string) bool {
 func IsValidMockLanguage(id string) bool {
 	switch LanguageID(id) {
 	case OpenTofuMock, TerraformMock:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsValidTerragruntLanguage reports whether the language is one of the
+// Terragrunt configuration files.
+func IsValidTerragruntLanguage(id string) bool {
+	switch LanguageID(id) {
+	case Terragrunt, TerragruntStack:
 		return true
 	default:
 		return false

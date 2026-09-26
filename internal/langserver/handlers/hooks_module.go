@@ -31,6 +31,9 @@ func updateDiagnostics(features *Features, dNotifier *diagnostics.Notifier) noti
 			if features.Tests != nil {
 				diags.Extend(features.Tests.Diagnostics(path))
 			}
+			if features.Terragrunt != nil {
+				diags.Extend(features.Terragrunt.Diagnostics(path))
+			}
 
 			dNotifier.PublishHCLDiags(ctx, path, diags)
 		}

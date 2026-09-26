@@ -30,11 +30,14 @@ func _() {
 	_ = x[OpTypeParseTestFiles-19]
 	_ = x[OpTypeDecodeTestReferences-20]
 	_ = x[OpTypeSchemaTestValidation-21]
+	_ = x[OpTypeParseTerragruntFiles-22]
+	_ = x[OpTypeDecodeTerragruntReferences-23]
+	_ = x[OpTypeSchemaTerragruntValidation-24]
 }
 
-const _OpType_name = "OpTypeUnknownOpTypeGetTofuVersionOpTypeGetInstalledTofuVersionOpTypeObtainSchemaOpTypeParseModuleConfigurationOpTypeParseVariablesOpTypeParseModuleManifestOpTypeLoadModuleMetadataOpTypeDecodeReferenceTargetsOpTypeDecodeReferenceOriginsOpTypeDecodeVarsReferencesOpTypeGetModuleDataFromRegistryOpTypeParseProviderVersionsOpTypePreloadEmbeddedSchemaOpTypeSchemaModuleValidationOpTypeSchemaVarsValidationOpTypeReferenceValidationOpTypeTofuValidateOpTypeSemanticValidationOpTypeParseTestFilesOpTypeDecodeTestReferencesOpTypeSchemaTestValidation"
+const _OpType_name = "OpTypeUnknownOpTypeGetTofuVersionOpTypeGetInstalledTofuVersionOpTypeObtainSchemaOpTypeParseModuleConfigurationOpTypeParseVariablesOpTypeParseModuleManifestOpTypeLoadModuleMetadataOpTypeDecodeReferenceTargetsOpTypeDecodeReferenceOriginsOpTypeDecodeVarsReferencesOpTypeGetModuleDataFromRegistryOpTypeParseProviderVersionsOpTypePreloadEmbeddedSchemaOpTypeSchemaModuleValidationOpTypeSchemaVarsValidationOpTypeReferenceValidationOpTypeTofuValidateOpTypeSemanticValidationOpTypeParseTestFilesOpTypeDecodeTestReferencesOpTypeSchemaTestValidationOpTypeParseTerragruntFilesOpTypeDecodeTerragruntReferencesOpTypeSchemaTerragruntValidation"
 
-var _OpType_index = [...]uint16{0, 13, 33, 62, 80, 110, 130, 155, 179, 207, 235, 261, 292, 319, 346, 374, 400, 425, 443, 467, 487, 513, 539}
+var _OpType_index = [...]uint16{0, 13, 33, 62, 80, 110, 130, 155, 179, 207, 235, 261, 292, 319, 346, 374, 400, 425, 443, 467, 487, 513, 539, 565, 597, 629}
 
 func (i OpType) String() string {
 	idx := int(i) - 0

@@ -24,7 +24,7 @@ func (svc *service) TextDocumentLink(ctx context.Context, params lsp.DocumentLin
 		return nil, err
 	}
 
-	if doc.LanguageID != ilsp.OpenTofu.String() {
+	if doc.LanguageID != ilsp.OpenTofu.String() && !ilsp.IsValidTerragruntLanguage(doc.LanguageID) {
 		return nil, nil
 	}
 
@@ -33,6 +33,10 @@ func (svc *service) TextDocumentLink(ctx context.Context, params lsp.DocumentLin
 		return nil, err
 	}
 	svc.stateStore.JobStore.WaitForJobs(ctx, jobIds...)
+
+	if ilsp.IsValidTerragruntLanguage(doc.LanguageID) {
+		return ilsp.Links(svc.terragruntLinks(doc), cc.TextDocument.DocumentLink), nil
+	}
 
 	d, err := svc.decoderForDocument(ctx, doc)
 	if err != nil {

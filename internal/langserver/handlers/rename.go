@@ -77,6 +77,10 @@ func (svc *service) symbolForRename(ctx context.Context, docURI lsp.DocumentURI,
 		return nil, err
 	}
 
+	if ilsp.IsValidTerragruntLanguage(doc.LanguageID) {
+		return nil, refactor.ErrNotRenamable
+	}
+
 	jobIds, err := svc.stateStore.JobStore.ListIncompleteJobsForDir(dh.Dir)
 	if err != nil {
 		return nil, err

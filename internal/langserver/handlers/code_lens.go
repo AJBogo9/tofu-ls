@@ -21,6 +21,12 @@ func (svc *service) TextDocumentCodeLens(ctx context.Context, params lsp.CodeLen
 	if err != nil {
 		return list, err
 	}
+	if ilsp.IsValidTerragruntLanguage(doc.LanguageID) {
+		// Other Terragrunt files read a file's values (include with expose,
+		// read_terragrunt_config), so a count of the uses in the file
+		// itself would undercount, and "0 references" would be wrong.
+		return list, nil
+	}
 
 	jobIds, err := svc.stateStore.JobStore.ListIncompleteJobsForDir(dh.Dir)
 	if err != nil {
