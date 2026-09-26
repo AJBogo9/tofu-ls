@@ -262,3 +262,44 @@ func TestFileCache_syntaxErrorNamesTheFile(t *testing.T) {
 		t.Fatalf("expected %q, got %q", want, err.Error())
 	}
 }
+
+func TestFileCache_syntaxErrorNamesTheFileInTheWorkspace(t *testing.T) {
+	workspace := filepath.FromSlash("/work")
+	child := filepath.Join(workspace, "modules", "app")
+	relPath := func(path string) string {
+		if rel, err := filepath.Rel(workspace, path); err == nil && !strings.HasPrefix(rel, "..") {
+			return rel
+		}
+		return ""
+	}
+	testCases := []struct {
+		name string
+		file string
+		want string
+	}{
+		// renaming from the root a symbol the child declares: the base is
+		// the child, the message still names the child's file in full
+		{"in the workspace", filepath.Join(child, "main.tf"), filepath.Join("modules", "app", "main.tf")},
+		// outside every workspace folder: relative to the base
+		{"outside the workspace", filepath.FromSlash("/other/app/main.tf"), filepath.Join("..", "..", "..", "other", "app", "main.tf")},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := newFileCache(Env{
+				ReadFile: func(path string) ([]byte, error) {
+					return []byte("resource \"x\" {\n"), nil
+				},
+				RelPath: relPath,
+			})
+			fc.base = child
+			_, _, err := fc.body(tc.file)
+			if err == nil {
+				t.Fatal("expected a syntax error")
+			}
+			want := tc.want + " has syntax errors; fix them before renaming"
+			if err.Error() != want {
+				t.Fatalf("expected %q, got %q", want, err.Error())
+			}
+		})
+	}
+}

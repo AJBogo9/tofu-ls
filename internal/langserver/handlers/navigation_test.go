@@ -277,6 +277,58 @@ func TestReferences_onReferenceInsideDeclaration(t *testing.T) {
 		}`, tmpDir.URI))
 }
 
+func TestReferences_forEach(t *testing.T) {
+	ls, tmpDir, stop := startNavigationServer(t, map[string]string{
+		"main.tf": `module "web" {
+  source   = "./web"
+  for_each = toset(["a", "b"])
+  stage    = each.key
+}
+
+output "web" {
+  value = module.web
+}
+`,
+		"web/main.tf": `variable "stage" {
+}
+`,
+	})
+	defer stop()
+
+	eachKey := fmt.Sprintf(`{"uri": "%s/main.tf", "range": {"start": {"line": 3, "character": 13}, "end": {"line": 3, "character": 21}}}`, tmpDir.URI)
+	module := fmt.Sprintf(`{"uri": "%s/main.tf", "range": {"start": {"line": 7, "character": 10}, "end": {"line": 7, "character": 20}}}`, tmpDir.URI)
+
+	testCases := []struct {
+		name      string
+		character int
+		expected  string
+	}{
+		// where the reference count lens of each.key and each.value
+		// asks: their references only, as the lens counts them
+		{"on the for_each name", 6, eachKey},
+		// elsewhere in the argument (the cursor of the upstream
+		// integration test, and a function in the expression): the
+		// module call around it as well
+		{"right after the for_each name", 10, eachKey + ", " + module},
+		{"on toset", 15, eachKey + ", " + module},
+	}
+	for i, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ls.CallAndExpectResponse(t, &langserver.CallRequest{
+				Method: "textDocument/references",
+				ReqParams: fmt.Sprintf(`{
+					"textDocument": {"uri": "%s/main.tf"},
+					"position": {"line": 2, "character": %d},
+					"context": {"includeDeclaration": false}
+				}`, tmpDir.URI, tc.character)}, fmt.Sprintf(`{
+					"jsonrpc": "2.0",
+					"id": %d,
+					"result": [%s]
+				}`, i+3, tc.expected))
+		})
+	}
+}
+
 func TestFoldingRange(t *testing.T) {
 	ls, tmpDir, stop := startNavigationServer(t, map[string]string{
 		"main.tf": navigationMainTf,
@@ -610,7 +662,30 @@ locals {
 			"textDocument": {"uri": "%s/app/outputs.tf"},
 			"position": {"line": 0, "character": 10},
 			"newName": "port"
-		}`, tmpDir.URI)}, &jrpc2.Error{Code: jrpc2.Code(-32098), Message: "module.keyed is iterated by a for expression (../main.tf:6), whose uses of first_port cannot be renamed safely; rename them by hand"})
+		}`, tmpDir.URI)}, &jrpc2.Error{Code: jrpc2.Code(-32098), Message: "module.keyed is iterated by a for expression (main.tf:6), whose uses of first_port cannot be renamed safely; rename them by hand"})
+}
+
+func TestRename_syntaxErrorNamesTheChildFile(t *testing.T) {
+	ls, tmpDir, stop := startNavigationServer(t, map[string]string{
+		"main.tf": `module "app" {
+  source = "./modules/app"
+  stage  = "dev"
+}
+`,
+		"modules/app/variables.tf": "variable \"stage\" {\n}\n",
+		"modules/app/main.tf":      "locals {\n  name = var.stage\n",
+	})
+	defer stop()
+
+	// renaming from the root: the file is the child module's main.tf, not
+	// the main.tf the user has open
+	ls.CallAndExpectError(t, &langserver.CallRequest{
+		Method: "textDocument/rename",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": {"line": 2, "character": 4},
+			"newName": "env_name"
+		}`, tmpDir.URI)}, &jrpc2.Error{Code: jrpc2.Code(-32098), Message: filepath.Join("modules", "app", "main.tf") + " has syntax errors; fix them before renaming"})
 }
 
 func TestRename_refusesMovedAndRemovedHistory(t *testing.T) {

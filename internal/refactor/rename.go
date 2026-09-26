@@ -93,6 +93,11 @@ type Env struct {
 	// InWorkspace reports whether a directory is inside one of the
 	// workspace folders. It may be nil, and then every directory is.
 	InWorkspace func(dir string) bool
+	// RelPath names a file for messages, relative to the workspace folder
+	// which holds it, or returns "" when no folder does. It may be nil.
+	// Without a name from it, messages name files relative to the module
+	// the request is about.
+	RelPath func(path string) string
 }
 
 // Symbol is a renamable declaration.
@@ -156,10 +161,15 @@ func (c *fileCache) source(path string) ([]byte, error) {
 	return src, nil
 }
 
-// displayPath names a file for messages, relative to the module the
-// request started in, so that main.tf of a child module is not mistaken
-// for the open main.tf.
+// displayPath names a file for messages, relative to the workspace (or
+// else to the module the request is about), so that main.tf of a child
+// module is not mistaken for the open main.tf, nor the other way round.
 func (c *fileCache) displayPath(path string) string {
+	if c.env.RelPath != nil {
+		if rel := c.env.RelPath(path); rel != "" {
+			return rel
+		}
+	}
 	if c.base != "" {
 		if rel, err := filepath.Rel(c.base, path); err == nil {
 			return rel

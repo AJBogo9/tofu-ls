@@ -107,6 +107,7 @@ func (svc *service) refactorEnv() refactor.Env {
 		ModuleCalls: svc.features.Modules.DeclaredModuleCalls,
 		ReadDir:     svc.fs.ReadDir,
 		InWorkspace: svc.workspace.contains,
+		RelPath:     svc.workspace.rel,
 	}
 }
 

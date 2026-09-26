@@ -56,3 +56,22 @@ func (w *workspaceDirs) contains(dir string) bool {
 	}
 	return false
 }
+
+// rel returns path relative to the innermost workspace folder which holds
+// it, for messages, or "" when no folder does.
+func (w *workspaceDirs) rel(path string) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	path = filepath.Clean(path)
+	best := ""
+	for _, d := range w.dirs {
+		rel, err := filepath.Rel(d, path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		if best == "" || len(rel) < len(best) {
+			best = rel
+		}
+	}
+	return best
+}
