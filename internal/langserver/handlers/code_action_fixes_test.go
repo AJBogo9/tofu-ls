@@ -116,12 +116,21 @@ func startCodeActionServer(t *testing.T, files map[string]string, caps string, o
 		}
 		return rsp.Result, nil
 	}
-	return &langserverMockCaller{call: call}, tmpDir, stop
+	callWithError := func(cr *langserver.CallRequest) (json.RawMessage, error) {
+		rsp, err := ls.CallWithError(t, cr)
+		if err != nil {
+			return nil, err
+		}
+		return rsp.Result, nil
+	}
+	return &langserverMockCaller{call: call, callWithError: callWithError}, tmpDir, stop
 }
 
 // langserverMockCaller sends requests to a server started for one test.
 type langserverMockCaller struct {
 	call func(cr *langserver.CallRequest) (json.RawMessage, error)
+	// callWithError returns an error response rather than failing the test.
+	callWithError func(cr *langserver.CallRequest) (json.RawMessage, error)
 }
 
 // codeActions requests the code actions of a range of a file.

@@ -107,54 +107,7 @@ func realigned(file string, src []byte, spans [][2]int) []Edit {
 	for _, s := range spans {
 		raw = append(raw, replace(file, src, s[0], s[1], ""))
 	}
-	body, ok := parse(file, src)
-	if !ok {
-		return raw
-	}
-	var edits []Edit
-	byRegion := map[region][]Edit{}
-	regions := make([]region, 0)
-	for _, e := range raw {
-		var r *region
-		inBlock := false
-		for _, block := range body.Blocks {
-			br := block.Range()
-			if e.Range.Start.Byte <= br.Start.Byte && br.End.Byte <= e.Range.End.Byte {
-				// the whole block goes: nothing to realign
-				inBlock = true
-				break
-			}
-			if br.Start.Byte <= e.Range.Start.Byte && e.Range.End.Byte <= br.End.Byte {
-				tr := topRegion(src, block)
-				r, inBlock = &tr, true
-				break
-			}
-		}
-		if !inBlock {
-			r = &region{0, len(src)}
-		}
-		if r == nil {
-			edits = append(edits, e)
-			continue
-		}
-		if _, ok := byRegion[*r]; !ok {
-			regions = append(regions, *r)
-		}
-		byRegion[*r] = append(byRegion[*r], e)
-	}
-	if whole, ok := byRegion[region{0, len(src)}]; ok && len(regions) > 1 {
-		// a top-level argument goes: lay out the file once
-		for _, r := range regions {
-			if r != (region{0, len(src)}) {
-				whole = append(whole, byRegion[r]...)
-			}
-		}
-		return append(edits, formattedRegion(file, src, region{0, len(src)}, whole, nil)...)
-	}
-	for _, r := range regions {
-		edits = append(edits, formattedRegion(file, src, r, byRegion[r], nil)...)
-	}
-	return edits
+	return laidOut(file, src, raw)
 }
 
 // alsoIn lists the files of locations other than the document's module

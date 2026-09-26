@@ -54,7 +54,8 @@ func initializeResponse(t *testing.T, commandPrefix string) string {
 				"documentHighlightProvider": true,
 				"documentSymbolProvider": true,
 				"codeActionProvider": {
-					"codeActionKinds": ["quickfix", "refactor.rewrite", "source.formatAll.opentofu"]
+					"codeActionKinds": ["quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source.formatAll.opentofu"],
+					"resolveProvider": true
 				},
 				"codeLensProvider": {},
 				"documentLinkProvider": {},

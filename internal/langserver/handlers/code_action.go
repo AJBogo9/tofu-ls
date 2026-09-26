@@ -34,13 +34,13 @@ import (
 // tofu init for a module directory given as its URI.
 const initCommand = "tofu.initCurrent"
 
-func (svc *service) TextDocumentCodeAction(ctx context.Context, params lsp.CodeActionParams) []lsp.CodeAction {
+func (svc *service) TextDocumentCodeAction(ctx context.Context, params lsp.CodeActionParams) []codeActionItem {
 	ca, err := svc.textDocumentCodeAction(ctx, params)
 	if err != nil {
 		svc.logger.Printf("code action failed: %s", err)
 	}
 
-	return ca
+	return codeActionItems(ca)
 }
 
 func (svc *service) textDocumentCodeAction(ctx context.Context, params lsp.CodeActionParams) ([]lsp.CodeAction, error) {
@@ -59,7 +59,8 @@ func (svc *service) textDocumentCodeAction(ctx context.Context, params lsp.CodeA
 	}
 	wantFix := ilsp.Wants(params.Context.Only, ilsp.QuickFix)
 	wantRewrite := ilsp.Wants(params.Context.Only, ilsp.RefactorRewrite)
-	if !wantFormat && !wantFix && !wantRewrite {
+	wantRefactor := wantsRefactorings(params.Context.Only)
+	if !wantFormat && !wantFix && !wantRewrite && !wantRefactor {
 		return nil, fmt.Errorf("could not find a supported code action to execute for %s, wanted %v",
 			params.TextDocument.URI, params.Context.Only)
 	}
@@ -114,6 +115,9 @@ func (svc *service) textDocumentCodeAction(ctx context.Context, params lsp.CodeA
 				}
 			}
 		}
+	}
+	if wantRefactor && langID == ilsp.OpenTofu {
+		ca = append(ca, svc.refactorings(ctx, doc, cdoc, params)...)
 	}
 
 	return ca, nil
@@ -184,6 +188,7 @@ func (svc *service) codeActionEnv(ctx context.Context) codeaction.Env {
 
 	cc, err := ilsp.ClientCapabilities(ctx)
 	if err == nil {
+		svc.refactoringEnv(ctx, &env, cc)
 		if we := cc.Workspace.WorkspaceEdit; we != nil && we.DocumentChanges {
 			for _, op := range we.ResourceOperations {
 				if op == "create" {

@@ -23,6 +23,13 @@ const (
 	// RefactorRewrite actions rewrite the expression at the cursor, such
 	// as element(list, i) as list[i].
 	RefactorRewrite = "refactor.rewrite"
+
+	// Refactor, RefactorExtract and RefactorInline are the refactorings:
+	// safe delete, extract to local and introduce variable, and inline
+	// local.
+	Refactor        = "refactor"
+	RefactorExtract = "refactor.extract"
+	RefactorInline  = "refactor.inline"
 )
 
 type CodeActions map[lsp.CodeActionKind]bool
@@ -48,6 +55,9 @@ var (
 		SourceFormatAllTofu: true,
 		QuickFix:            true,
 		RefactorRewrite:     true,
+		Refactor:            true,
+		RefactorExtract:     true,
+		RefactorInline:      true,
 	}
 )
 
