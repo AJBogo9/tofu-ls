@@ -75,7 +75,9 @@ func TestSchemaVarsValidation_FullModule(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedCount := 2
+	// Undeclared names ("bar", "noot") are reported by the module's
+	// semantic validation (see checks.TestTfvars), not by this job.
+	expectedCount := 0
 	diagsCount := mod.VarsDiagnostics[ast.SchemaValidationSource].Count()
 	if diagsCount != expectedCount {
 		t.Fatalf("expected %d diagnostics, %d given", expectedCount, diagsCount)
@@ -128,7 +130,8 @@ func TestSchemaVarsValidation_SingleFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectedCount := 1
+	// see TestSchemaVarsValidation_FullModule
+	expectedCount := 0
 	diagsCount := mod.VarsDiagnostics[ast.SchemaValidationSource].Count()
 	if diagsCount != expectedCount {
 		t.Fatalf("expected %d diagnostics, %d given", expectedCount, diagsCount)

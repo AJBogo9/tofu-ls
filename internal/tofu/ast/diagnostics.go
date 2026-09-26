@@ -19,6 +19,9 @@ const (
 	TofuValidateSource
 	// UnusedSymbolsSource reports variables and locals nothing references.
 	UnusedSymbolsSource
+	// SemanticValidationSource reports the checks which need the whole
+	// module (duplicates, references, types, tfvars, installation).
+	SemanticValidationSource
 )
 
 func (d DiagnosticSource) String() string {

@@ -26,11 +26,12 @@ func _() {
 	_ = x[OpTypeSchemaVarsValidation-15]
 	_ = x[OpTypeReferenceValidation-16]
 	_ = x[OpTypeTofuValidate-17]
+	_ = x[OpTypeSemanticValidation-18]
 }
 
-const _OpType_name = "OpTypeUnknownOpTypeGetTofuVersionOpTypeGetInstalledTofuVersionOpTypeObtainSchemaOpTypeParseModuleConfigurationOpTypeParseVariablesOpTypeParseModuleManifestOpTypeLoadModuleMetadataOpTypeDecodeReferenceTargetsOpTypeDecodeReferenceOriginsOpTypeDecodeVarsReferencesOpTypeGetModuleDataFromRegistryOpTypeParseProviderVersionsOpTypePreloadEmbeddedSchemaOpTypeSchemaModuleValidationOpTypeSchemaVarsValidationOpTypeReferenceValidationOpTypeTofuValidate"
+const _OpType_name = "OpTypeUnknownOpTypeGetTofuVersionOpTypeGetInstalledTofuVersionOpTypeObtainSchemaOpTypeParseModuleConfigurationOpTypeParseVariablesOpTypeParseModuleManifestOpTypeLoadModuleMetadataOpTypeDecodeReferenceTargetsOpTypeDecodeReferenceOriginsOpTypeDecodeVarsReferencesOpTypeGetModuleDataFromRegistryOpTypeParseProviderVersionsOpTypePreloadEmbeddedSchemaOpTypeSchemaModuleValidationOpTypeSchemaVarsValidationOpTypeReferenceValidationOpTypeTofuValidateOpTypeSemanticValidation"
 
-var _OpType_index = [...]uint16{0, 13, 33, 62, 80, 110, 130, 155, 179, 207, 235, 261, 292, 319, 346, 374, 400, 425, 443}
+var _OpType_index = [...]uint16{0, 13, 33, 62, 80, 110, 130, 155, 179, 207, 235, 261, 292, 319, 346, 374, 400, 425, 443, 467}
 
 func (i OpType) String() string {
 	if i >= OpType(len(_OpType_index)-1) {

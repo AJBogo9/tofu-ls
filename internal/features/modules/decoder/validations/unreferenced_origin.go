@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/hcl-lang/lang"
 	"github.com/hashicorp/hcl-lang/reference"
 	"github.com/hashicorp/hcl/v2"
+	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 )
 
 func UnreferencedOrigins(ctx context.Context, pathCtx *decoder.PathContext) lang.DiagnosticsMap {
@@ -58,6 +59,13 @@ func UnreferencedOrigins(ctx context.Context, pathCtx *decoder.PathContext) lang
 		}
 
 		_, ok = pathCtx.ReferenceTargets.Match(localOrigin)
+		if !ok && declared(pathCtx.ReferenceTargets, address) {
+			// The declaration exists, but its type does not match what the
+			// origin's position expects, such as a list variable in
+			// "${var.list}", which returns the list unchanged. Whether the
+			// value fits is not a question of declaration.
+			ok = true
+		}
 		if !ok {
 			// target not found
 			fileName := origin.OriginRange().Filename
@@ -65,6 +73,10 @@ func UnreferencedOrigins(ctx context.Context, pathCtx *decoder.PathContext) lang
 				Severity: hcl.DiagError,
 				Summary:  fmt.Sprintf("No declaration found for %q", address),
 				Subject:  origin.OriginRange().Ptr(),
+				Extra: ilsp.CodedDiagnostic{
+					Code: ilsp.CodeUnresolvedReference,
+					Data: map[string]interface{}{"address": address.String()},
+				},
 			}
 			diagsMap[fileName] = diagsMap[fileName].Append(d)
 
@@ -74,4 +86,15 @@ func UnreferencedOrigins(ctx context.Context, pathCtx *decoder.PathContext) lang
 	}
 
 	return diagsMap
+}
+
+// declared reports whether a target has the given address, whatever its
+// type.
+func declared(targets reference.Targets, address lang.Address) bool {
+	for _, target := range targets {
+		if target.Addr.Equals(address) {
+			return true
+		}
+	}
+	return false
 }

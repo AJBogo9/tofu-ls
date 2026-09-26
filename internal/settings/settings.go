@@ -24,6 +24,38 @@ type ExperimentalFeatures struct {
 type ValidationOptions struct {
 	EnableEnhancedValidation bool `mapstructure:"enableEnhancedValidation" default:"true"`
 
+	// The check families below run only with EnableEnhancedValidation.
+
+	// DuplicateDeclarations reports variables, outputs, locals, module
+	// calls, resources, data sources and providers declared twice.
+	DuplicateDeclarations bool `mapstructure:"duplicateDeclarations" default:"true"`
+	// UnresolvedReferences reports references to undeclared objects and
+	// each, count and self outside their scope.
+	UnresolvedReferences bool `mapstructure:"unresolvedReferences" default:"true"`
+	// UnknownResourceTypes reports resource and data source types which
+	// the provider's loaded schema does not have.
+	UnknownResourceTypes bool `mapstructure:"unknownResourceTypes" default:"true"`
+	// VariableTypes reports invalid type constraints and defaults which
+	// do not convert to their type.
+	VariableTypes bool `mapstructure:"variableTypes" default:"true"`
+	// Tfvars reports undeclared names, values of the wrong type and
+	// non-static values in .tfvars files.
+	Tfvars bool `mapstructure:"tfvars" default:"true"`
+	// StaticValues reports references where only static values are
+	// allowed (variable defaults, depends_on, module sources, backends).
+	StaticValues bool `mapstructure:"staticValues" default:"true"`
+	// OperandTypes reports operands whose known type cannot convert to
+	// what the operator needs.
+	OperandTypes bool `mapstructure:"operandTypes" default:"true"`
+	// Installation reports modules and providers that tofu init has not
+	// installed, and local module sources that do not exist.
+	Installation bool `mapstructure:"installation" default:"true"`
+	// UnusedDataSources reports data sources nothing references.
+	UnusedDataSources bool `mapstructure:"unusedDataSources" default:"true"`
+	// InterpolationOnly reports "${...}" templates which only wrap an
+	// expression.
+	InterpolationOnly bool `mapstructure:"interpolationOnly" default:"true"`
+
 	// UnusedSymbols is copied from DiagnosticsOptions, so that it
 	// reaches the module jobs together with the validation options.
 	UnusedSymbols bool `mapstructure:"-"`

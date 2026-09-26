@@ -57,15 +57,17 @@ func UnusedSymbols(ctx context.Context, fs ReadOnlyFS, modStore *state.ModuleSto
 
 		tfvars := tfvarsKeys(fs, modPath)
 		for _, sym := range refactor.UnusedSymbols(files) {
-			var summary string
+			var summary, code string
 			switch sym.Kind {
 			case refactor.KindVariable:
 				summary = fmt.Sprintf("Variable %q is declared but not used in this module", sym.Name)
 				if setIn := tfvars[sym.Name]; len(setIn) > 0 {
 					summary += fmt.Sprintf(" (only set in %s)", strings.Join(setIn, ", "))
 				}
+				code = ilsp.CodeUnusedVariable
 			case refactor.KindLocal:
 				summary = fmt.Sprintf("Local value %q is declared but not used", sym.Name)
+				code = ilsp.CodeUnusedLocal
 			}
 			rng := sym.NameRange
 			name := ast.ModFilename(sym.Filename)
@@ -73,7 +75,11 @@ func UnusedSymbols(ctx context.Context, fs ReadOnlyFS, modStore *state.ModuleSto
 				Severity: hcl.DiagWarning,
 				Summary:  summary,
 				Subject:  &rng,
-				Extra:    ilsp.UnnecessaryCode{},
+				Extra: ilsp.CodedDiagnostic{
+					Code:        code,
+					Data:        map[string]interface{}{"name": sym.Name},
+					Unnecessary: true,
+				},
 			})
 		}
 	}
