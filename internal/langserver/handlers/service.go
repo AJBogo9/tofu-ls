@@ -93,6 +93,8 @@ type service struct {
 	inlayHintRefresh bool
 	inlayRefreshMu   sync.Mutex
 	inlayRefresh     *time.Timer
+	// set on shutdown, after which no refresh is scheduled
+	inlayRefreshStopped bool
 
 	// workspace holds the workspace folders.
 	workspace workspaceDirs
@@ -476,6 +478,8 @@ func (svc *service) Assigner() (jrpc2.Assigner, error) {
 	// For use in tests, e.g. to test request cancellation
 	maps.Copy(m, svc.additionalHandlers)
 
+	svc.recoverHandlers(m)
+
 	return m, nil
 }
 
@@ -663,6 +667,8 @@ func (svc *service) Finish(_ jrpc2.Assigner, status jrpc2.ServerStatus) {
 }
 
 func (svc *service) shutdown() {
+	svc.stopInlayHintRefresh()
+
 	if svc.closedDirWalker != nil {
 		svc.logger.Printf("stopping closedDirWalker for session ...")
 		svc.closedDirWalker.Stop()

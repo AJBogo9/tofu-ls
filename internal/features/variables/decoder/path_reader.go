@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/hcl-lang/decoder"
 	"github.com/hashicorp/hcl-lang/lang"
 	tfmod "github.com/opentofu/opentofu-schema/module"
+	"github.com/opentofu/tofu-ls/internal/decoder/refcache"
 	"github.com/opentofu/tofu-ls/internal/document"
 	"github.com/opentofu/tofu-ls/internal/features/variables/state"
 	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
@@ -30,9 +31,14 @@ type PathReader struct {
 	StateReader  StateReader
 	ModuleReader ModuleReader
 	UseAnySchema bool
+
+	// ReferenceCache, when set, keeps the reference contexts of variable
+	// files across calls of ReferencePathContext.
+	ReferenceCache *refcache.Cache[state.VariableRecord]
 }
 
 var _ decoder.PathReader = &PathReader{}
+var _ decoder.ReferencePathReader = &PathReader{}
 
 func (pr *PathReader) Paths(ctx context.Context) []lang.Path {
 	paths := make([]lang.Path, 0)
@@ -59,4 +65,16 @@ func (pr *PathReader) PathContext(path lang.Path) (*decoder.PathContext, error) 
 		return nil, err
 	}
 	return variablePathContext(mod, pr.ModuleReader, pr.UseAnySchema)
+}
+
+// ReferencePathContext returns the reference origins and the files of
+// the variable files, without their schema, for reference lookups across
+// paths (see decoder.ReferencePathReader).
+func (pr *PathReader) ReferencePathContext(path lang.Path) (*decoder.PathContext, error) {
+	mod, err := pr.StateReader.VariableRecordByPath(path.Path)
+	if err != nil {
+		pr.ReferenceCache.Forget(path.Path)
+		return nil, err
+	}
+	return pr.ReferenceCache.Get(path.Path, mod, variableReferenceContext), nil
 }

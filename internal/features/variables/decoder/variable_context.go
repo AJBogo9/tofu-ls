@@ -42,6 +42,27 @@ func variablePathContext(mod *state.VariableRecord, moduleReader ModuleReader, u
 		pathCtx.Validators = varsValidators
 	}
 
+	addVarsReferencesAndFiles(pathCtx, mod)
+
+	return pathCtx, nil
+}
+
+// variableReferenceContext returns the part of the path context that
+// reference lookups read, with an index of its origins, and without the
+// schema, which variablePathContext builds from the module's inputs.
+func variableReferenceContext(mod *state.VariableRecord) *decoder.PathContext {
+	pathCtx := &decoder.PathContext{
+		ReferenceOrigins: make(reference.Origins, 0),
+		ReferenceTargets: make(reference.Targets, 0),
+		Files:            make(map[string]*hcl.File),
+	}
+	addVarsReferencesAndFiles(pathCtx, mod)
+	pathCtx.ReferenceOriginIndex = reference.NewOriginIndex(pathCtx.ReferenceOrigins)
+
+	return pathCtx
+}
+
+func addVarsReferencesAndFiles(pathCtx *decoder.PathContext, mod *state.VariableRecord) {
 	for _, origin := range mod.VarsRefOrigins {
 		if ast.IsVarsFilename(origin.OriginRange().Filename) {
 			pathCtx.ReferenceOrigins = append(pathCtx.ReferenceOrigins, origin)
@@ -51,6 +72,4 @@ func variablePathContext(mod *state.VariableRecord, moduleReader ModuleReader, u
 	for name, f := range mod.ParsedVarsFiles {
 		pathCtx.Files[name.String()] = f
 	}
-
-	return pathCtx, nil
 }

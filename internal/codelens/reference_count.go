@@ -192,9 +192,10 @@ type originKey struct {
 // It is meant for one request, during which the indexed modules do not
 // change.
 type cachedPathReader struct {
-	reader decoder.PathReader
-	paths  []lang.Path
-	ctxs   map[lang.Path]cachedPathContext
+	reader  decoder.PathReader
+	paths   []lang.Path
+	ctxs    map[lang.Path]cachedPathContext
+	refCtxs map[lang.Path]cachedPathContext
 }
 
 type cachedPathContext struct {
@@ -203,7 +204,11 @@ type cachedPathContext struct {
 }
 
 func newCachedPathReader(reader decoder.PathReader) *cachedPathReader {
-	return &cachedPathReader{reader: reader, ctxs: make(map[lang.Path]cachedPathContext)}
+	return &cachedPathReader{
+		reader:  reader,
+		ctxs:    make(map[lang.Path]cachedPathContext),
+		refCtxs: make(map[lang.Path]cachedPathContext),
+	}
 }
 
 func (r *cachedPathReader) Paths(ctx context.Context) []lang.Path {
@@ -219,6 +224,17 @@ func (r *cachedPathReader) PathContext(path lang.Path) (*decoder.PathContext, er
 	}
 	pathCtx, err := r.reader.PathContext(path)
 	r.ctxs[path] = cachedPathContext{pathCtx: pathCtx, err: err}
+	return pathCtx, err
+}
+
+// ReferencePathContext lets decoder.OriginsTargeting read the reference
+// contexts of the underlying reader, which skip the schema.
+func (r *cachedPathReader) ReferencePathContext(path lang.Path) (*decoder.PathContext, error) {
+	if c, ok := r.refCtxs[path]; ok {
+		return c.pathCtx, c.err
+	}
+	pathCtx, err := decoder.ReferencePathContext(r.reader, path)
+	r.refCtxs[path] = cachedPathContext{pathCtx: pathCtx, err: err}
 	return pathCtx, err
 }
 

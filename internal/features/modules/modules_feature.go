@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/hcl-lang/decoder"
 	"github.com/hashicorp/hcl-lang/lang"
 	tfmod "github.com/opentofu/opentofu-schema/module"
+	"github.com/opentofu/tofu-ls/internal/decoder/refcache"
 	"github.com/opentofu/tofu-ls/internal/document"
 	"github.com/opentofu/tofu-ls/internal/eventbus"
 	fdecoder "github.com/opentofu/tofu-ls/internal/features/modules/decoder"
@@ -38,6 +39,9 @@ type ModulesFeature struct {
 	stateStore     *globalState.StateStore
 	registryClient registry.Client
 	fs             jobs.ReadOnlyFS
+
+	// reference contexts of modules, kept across requests
+	referenceCache *refcache.Cache[state.ModuleRecord]
 }
 
 func NewModulesFeature(eventbus *eventbus.EventBus, stateStore *globalState.StateStore, fs jobs.ReadOnlyFS, rootFeature fdecoder.RootReader, registryClient registry.Client) (*ModulesFeature, error) {
@@ -56,6 +60,7 @@ func NewModulesFeature(eventbus *eventbus.EventBus, stateStore *globalState.Stat
 		rootFeature:    rootFeature,
 		fs:             fs,
 		registryClient: registryClient,
+		referenceCache: refcache.New[state.ModuleRecord](),
 	}, nil
 }
 
@@ -121,6 +126,18 @@ func (f *ModulesFeature) PathContext(path lang.Path) (*decoder.PathContext, erro
 	}
 
 	return pathReader.PathContext(path)
+}
+
+// ReferencePathContext returns the module's reference origins, targets
+// and files, without its schema (see decoder.ReferencePathReader).
+func (f *ModulesFeature) ReferencePathContext(path lang.Path) (*decoder.PathContext, error) {
+	pathReader := &fdecoder.PathReader{
+		StateReader:    f.Store,
+		RootReader:     f.rootFeature,
+		ReferenceCache: f.referenceCache,
+	}
+
+	return pathReader.ReferencePathContext(path)
 }
 
 func (f *ModulesFeature) Paths(ctx context.Context) []lang.Path {

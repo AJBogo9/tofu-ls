@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/hcl-lang/decoder"
 	"github.com/hashicorp/hcl-lang/lang"
+	"github.com/opentofu/tofu-ls/internal/decoder/refcache"
 	"github.com/opentofu/tofu-ls/internal/eventbus"
 	fdecoder "github.com/opentofu/tofu-ls/internal/features/variables/decoder"
 	"github.com/opentofu/tofu-ls/internal/features/variables/jobs"
@@ -31,6 +32,9 @@ type VariablesFeature struct {
 	moduleFeature fdecoder.ModuleReader
 	stateStore    *globalState.StateStore
 	fs            jobs.ReadOnlyFS
+
+	// reference contexts of variable files, kept across requests
+	referenceCache *refcache.Cache[state.VariableRecord]
 }
 
 func NewVariablesFeature(eventbus *eventbus.EventBus, stateStore *globalState.StateStore, fs jobs.ReadOnlyFS, moduleFeature fdecoder.ModuleReader) (*VariablesFeature, error) {
@@ -48,6 +52,8 @@ func NewVariablesFeature(eventbus *eventbus.EventBus, stateStore *globalState.St
 		moduleFeature: moduleFeature,
 		stateStore:    stateStore,
 		fs:            fs,
+
+		referenceCache: refcache.New[state.VariableRecord](),
 	}, nil
 }
 
@@ -111,6 +117,18 @@ func (f *VariablesFeature) PathContext(path lang.Path) (*decoder.PathContext, er
 	}
 
 	return pathReader.PathContext(path)
+}
+
+// ReferencePathContext returns the reference origins and files of the
+// variable files, without their schema (see decoder.ReferencePathReader).
+func (f *VariablesFeature) ReferencePathContext(path lang.Path) (*decoder.PathContext, error) {
+	pathReader := &fdecoder.PathReader{
+		StateReader:    f.store,
+		ModuleReader:   f.moduleFeature,
+		ReferenceCache: f.referenceCache,
+	}
+
+	return pathReader.ReferencePathContext(path)
 }
 
 func (f *VariablesFeature) Paths(ctx context.Context) []lang.Path {

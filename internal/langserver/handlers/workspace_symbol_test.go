@@ -319,3 +319,89 @@ func TestLangServer_workspace_symbol_missing(t *testing.T) {
 		]
 	}`, tmpDir.URI))
 }
+
+func TestLangServer_workspace_symbol_installedModules(t *testing.T) {
+	tmpDir := TempDir(t)
+	InitPluginCache(t, tmpDir.Path())
+
+	installed := filepath.Join(tmpDir.Path(), ".terraform", "modules", "vpc")
+	if err := os.MkdirAll(installed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir.Path(), "main.tf"), []byte("myblock \"own\" {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(installed, "main.tf"), []byte("myblock \"installed\" {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installedURI := document.DirHandleFromPath(installed).URI
+
+	ss, err := state.NewStateStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wc := walker.NewWalkerCollector()
+
+	ls := langserver.NewLangServerMock(t, NewMockSession(&MockSessionInput{
+		TofuCalls: &exec.TofuMockCalls{
+			PerWorkDir: map[string][]*mock.Call{
+				tmpDir.Path(): validTfMockCalls(),
+				installed:     validTfMockCalls(),
+			},
+		},
+		StateStore:      ss,
+		WalkerCollector: wc,
+	}))
+	stop := ls.Start(t)
+	defer stop()
+
+	ls.Call(t, &langserver.CallRequest{
+		Method: "initialize",
+		ReqParams: fmt.Sprintf(`{
+		"capabilities": {},
+		"rootUri": %q,
+		"processId": 12345
+	}`, tmpDir.URI)})
+	waitForWalkerPath(t, ss, wc, tmpDir)
+	ls.Notify(t, &langserver.CallRequest{
+		Method:    "initialized",
+		ReqParams: "{}",
+	})
+	// both modules are parsed, as after Find References decoded the workspace
+	for _, uri := range []string{tmpDir.URI + "/main.tf", installedURI + "/main.tf"} {
+		ls.Call(t, &langserver.CallRequest{
+			Method: "textDocument/didOpen",
+			ReqParams: fmt.Sprintf(`{
+			"textDocument": {
+				"version": 0,
+				"languageId": "opentofu",
+				"text": "myblock \"%s\" {}\n",
+				"uri": %q
+			}
+		}`, map[bool]string{true: "installed", false: "own"}[uri != tmpDir.URI+"/main.tf"], uri)})
+	}
+	waitForAllJobs(t, ss)
+
+	// the installed copy of the module is left out
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "workspace/symbol",
+		ReqParams: `{
+		"query": "myblock"
+	}`}, fmt.Sprintf(`{
+		"jsonrpc": "2.0",
+		"id": 4,
+		"result": [
+			{
+				"location": {
+					"uri": "%s/main.tf",
+					"range": {
+						"start": {"line": 0, "character": 0},
+						"end": {"line": 0, "character": 16}
+					}
+				},
+				"name": "myblock \"own\"",
+				"kind": 5
+			}
+		]
+	}`, tmpDir.URI))
+}
