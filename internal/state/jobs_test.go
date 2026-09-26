@@ -794,3 +794,71 @@ func TestJobStore_FinishJob_dependsOn(t *testing.T) {
 		t.Fatalf("unexpected DependsOn: %s", diff)
 	}
 }
+
+// A job which finds its state already claimed by a running job of the
+// same type skips its work ("state not changed"), and its dependents then
+// read what the running job has not written yet: a module opened while
+// its caller's indexing parses it got its metadata from no files. Jobs of
+// one type for one directory therefore run one after the other.
+func TestJobStore_EnqueueJob_afterJobOfSameTypeAndDir(t *testing.T) {
+	ss, err := NewStateStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	ctx = lsctx.WithDocumentContext(ctx, lsctx.Document{})
+	dir := document.DirHandleFromPath(t.TempDir())
+	otherDir := document.DirHandleFromPath(t.TempDir())
+	enqueue := func(dir document.DirHandle, typ string) job.ID {
+		id, err := ss.JobStore.EnqueueJob(ctx, job.Job{
+			Func: func(ctx context.Context) error { return nil },
+			Dir:  dir,
+			Type: typ,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	next := func(timeout time.Duration) (job.ID, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		_, id, _, err := ss.JobStore.AwaitNextJob(ctx, job.LowPriority)
+		return id, err
+	}
+
+	running := enqueue(dir, "parse")
+	if id, err := next(time.Second); err != nil || id != running {
+		t.Fatalf("expected %q to run, got %q (%v)", running, id, err)
+	}
+
+	sameType := enqueue(dir, "parse")
+	otherType := enqueue(dir, "metadata")
+	elsewhere := enqueue(otherDir, "parse")
+
+	// jobs of another type or directory run at once
+	started := job.IDs{}
+	for i := 0; i < 2; i++ {
+		id, err := next(time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started = append(started, id)
+	}
+	sort.Slice(started, func(i, j int) bool { return started[i] < started[j] })
+	if diff := cmp.Diff(job.IDs{otherType, elsewhere}, started); diff != "" {
+		t.Fatalf("unexpected jobs started: %s", diff)
+	}
+	// the one of the same type waits for the running one
+	if id, err := next(200 * time.Millisecond); err == nil {
+		t.Fatalf("expected %q to wait for %q, got %q", sameType, running, id)
+	}
+
+	if err := ss.JobStore.FinishJob(running, nil); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := next(time.Second); err != nil || id != sameType {
+		t.Fatalf("expected %q to run, got %q (%v)", sameType, id, err)
+	}
+}

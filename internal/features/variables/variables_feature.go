@@ -69,7 +69,10 @@ func (f *VariablesFeature) Start(ctx context.Context) {
 	ctx, cancelFunc := context.WithCancel(ctx)
 	f.stopFunc = cancelFunc
 
-	discover := f.eventbus.OnDiscover("feature.variables", nil)
+	// the walker waits until a directory is recorded, so that the didOpen
+	// of one of its documents finds the record and parses its var files
+	discoverDone := make(chan struct{}, 10)
+	discover := f.eventbus.OnDiscover("feature.variables", discoverDone)
 
 	didOpenDone := make(chan struct{}, 10)
 	didOpen := f.eventbus.OnDidOpen("feature.variables", didOpenDone)
@@ -86,6 +89,7 @@ func (f *VariablesFeature) Start(ctx context.Context) {
 			case discover := <-discover:
 				// TODO? collect errors
 				f.discover(discover.Path, discover.Files)
+				discoverDone <- struct{}{}
 			case didOpen := <-didOpen:
 				// TODO? collect errors
 				f.didOpen(didOpen.Context, didOpen.Dir, didOpen.LanguageID)

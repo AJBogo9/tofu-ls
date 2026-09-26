@@ -100,6 +100,22 @@ func (js *JobStore) EnqueueJob(ctx context.Context, newJob job.Job) (job.ID, err
 			dependsOn = append(dependsOn, jobId)
 		}
 	}
+	// A job of the same type for the same directory which is queued or
+	// running goes first. A job which finds its state claimed by such a
+	// job skips its work ("state not changed"), and its dependents would
+	// then read what the other job has not written yet.
+	for _, state := range []State{StateQueued, StateRunning} {
+		it, err := txn.Get(js.tableName, "dir_state_type", newJob.Dir, state, newJob.Type)
+		if err != nil {
+			return "", err
+		}
+		for obj := it.Next(); obj != nil; obj = it.Next() {
+			sj := obj.(*ScheduledJob)
+			if _, ok := idIsInSlice(dependsOn, sj.ID); !ok {
+				dependsOn = append(dependsOn, sj.ID)
+			}
+		}
+	}
 	newJob.DependsOn = dependsOn
 	dirOpen := isDirOpen(txn, newJob.Dir)
 

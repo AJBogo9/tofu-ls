@@ -144,7 +144,7 @@ func (svc *service) providerCompletionExtras(ctx context.Context, doc *document.
 		decl, seen := byName[name]
 		if !seen {
 			source := svc.providerSourceFor(name)
-			edit, ok := requiredproviders.AddEntryEdit(files, doc.Filename, name, source)
+			edit, ok := requiredproviders.AddEntryEdit(files, doc.Filename, name, source, requiredproviders.EntryOptions{})
 			decl = declaration{edit: edit, ok: ok}
 			if ok && edit.Filename != doc.Filename {
 				decl.command = svc.addRequiredProviderCommand(ctx, doc, name, source)
@@ -246,7 +246,7 @@ func addRequiredProviderEdit(files map[string]*hcl.File, dir, filename, name, so
 	if _, ok := requiredproviders.Entries(files)[name]; ok {
 		return lsp.ApplyWorkspaceEditParams{}, false
 	}
-	edit, ok := requiredproviders.AddEntryEdit(files, filename, name, source)
+	edit, ok := requiredproviders.AddEntryEdit(files, filename, name, source, requiredproviders.EntryOptions{})
 	if !ok {
 		return lsp.ApplyWorkspaceEditParams{}, false
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/opentofu/tofu-ls/internal/requiredproviders"
 	"github.com/zclconf/go-cty/cty"
 )
 
@@ -44,67 +45,40 @@ func addRequiredProvider(env Env, doc Document, body *hclsyntax.Body, pos hcl.Po
 		return nil
 	}
 
-	files, ok := moduleSources(env, doc)
+	sources, ok := moduleSources(env, doc)
 	if !ok {
 		return nil
 	}
-	var tf, rp *hclsyntax.Block
-	var tfFile sourceFile
-	for _, f := range files {
-		if strings.HasSuffix(f.path, ".json") {
-			continue
-		}
-		for _, b := range f.body.Blocks {
-			if b.Type != "terraform" {
-				continue
-			}
-			for _, nested := range b.Body.Blocks {
-				if nested.Type != "required_providers" {
-					continue
-				}
-				if _, ok := nested.Body.Attributes[local]; ok {
-					return nil
-				}
-				if rp == nil {
-					tf, rp, tfFile = b, nested, f
-				}
-			}
-			if tf == nil || (rp == nil && filepath.Base(f.path) == "versions.tf" && filepath.Base(tfFile.path) != "versions.tf") {
-				tf, tfFile = b, f
-			}
-		}
+	files := make(map[string]*hcl.File, len(sources))
+	for _, f := range sources {
+		files[filepath.Base(f.path)] = &hcl.File{Body: f.body, Bytes: f.src}
+	}
+	if _, ok := requiredproviders.Entries(files)[local]; ok {
+		return nil
 	}
 
-	entry := fmt.Sprintf("%s = {\n  source = %q\n", local, "hashicorp/"+local)
+	opts := requiredproviders.EntryOptions{CreateVersionsFile: env.CreateFiles}
 	if v, ok := lockedVersion(env, doc.dir(), local); ok {
-		entry += fmt.Sprintf("  version = %q\n", v)
+		opts.Version = v
 	}
-	entry += "}"
+	e, ok := requiredproviders.AddEntryEdit(files, filepath.Base(doc.Path), local, "hashicorp/"+local, opts)
+	if !ok {
+		return nil
+	}
 	title := fmt.Sprintf("Add %q to required_providers", local)
-
-	switch {
-	case rp != nil:
-		edits := formattedBlock(tfFile.path, tfFile.src, tf, rp, insertInBody(tfFile.path, tfFile.src, rp, []string{entry}, nil))
-		return []Action{{Title: title, Edits: edits}}
-	case tf != nil:
-		nested := "required_providers {\n" + indentLines(entry, indentUnit) + "\n}"
-		edits := formattedBlock(tfFile.path, tfFile.src, tf, tf, insertInBody(tfFile.path, tfFile.src, tf, nil, []string{nested}))
-		return []Action{{Title: title, Edits: edits}}
-	}
-
-	text := "terraform {\n  required_providers {\n" + indentLines(entry, "    ") + "\n  }\n}\n"
-	target := filepath.Join(doc.dir(), "versions.tf")
-	if src, ok := env.readFile(target); ok {
-		return []Action{{Title: title + " in versions.tf", Edits: []Edit{appendBlock(target, src, text)}}}
-	}
-	if env.CreateFiles {
+	target := filepath.Join(doc.dir(), e.Filename)
+	if e.Create {
 		return []Action{{
-			Title:  title + " in a new versions.tf",
+			Title:  title + " in a new " + e.Filename,
 			Create: []string{target},
-			Edits:  []Edit{replace(target, nil, 0, 0, text)},
+			Edits:  []Edit{replace(target, nil, 0, 0, e.NewText)},
 		}}
 	}
-	return []Action{{Title: title, Edits: []Edit{appendBlock(doc.Path, doc.Text, text)}}}
+	if e.NewBlock && target != doc.Path {
+		title += " in " + e.Filename
+	}
+	src := files[e.Filename].Bytes
+	return []Action{{Title: title, Edits: []Edit{replace(target, src, e.Range.Start.Byte, e.Range.End.Byte, e.NewText)}}}
 }
 
 // providerLocalName is the local name of the provider of a resource or
