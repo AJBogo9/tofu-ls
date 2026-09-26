@@ -29,7 +29,7 @@ func (svc *service) SelectionRange(ctx context.Context, params lsp.SelectionRang
 		var ranges []lsp.Range
 		if !strings.HasSuffix(doc.Filename, ".json") {
 			for _, rng := range selection.Ranges(doc.Text, doc.Filename, pos) {
-				ranges = append(ranges, ilsp.HCLRangeToLSP(rng))
+				ranges = append(ranges, ilsp.HCLRangeToLSPInText(rng, doc.Text))
 			}
 		}
 		if len(ranges) == 0 {

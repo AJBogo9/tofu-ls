@@ -235,6 +235,16 @@ func findSymbol(ctx context.Context, env Env, fc *fileCache, path lang.Path, fil
 		return nil, err
 	}
 
+	if !strings.HasSuffix(file, ".json") && !strings.HasSuffix(file, ".tfvars") {
+		// the output in module.x.out, module.x["a"].out, module.x[*].out
+		// or module.x[local.k].out, read from the syntax, since a decoded
+		// origin gives no range for a step after an index
+		sym, err := moduleOutputAtPos(env, fc, path, filepath.Join(path.Path, file), pos)
+		if sym != nil || err != nil {
+			return sym, err
+		}
+	}
+
 	origins, onOrigin := pathCtx.ReferenceOrigins.AtPos(file, pos)
 	if !onOrigin && !strings.HasSuffix(file, ".json") && !strings.HasSuffix(file, ".tfvars") {
 		// a reference the schema does not decode, e.g. in a validation
@@ -274,7 +284,7 @@ func findSymbol(ctx context.Context, env Env, fc *fileCache, path lang.Path, fil
 		}
 		if sym.NameRange.ContainsPos(pos) || sym.NameRange.End == pos {
 			sym.CursorRange = sym.NameRange
-			return sym, nil
+			return primarySymbol(fc, pathCtx, sym)
 		}
 	}
 
@@ -366,17 +376,47 @@ func checkScopedDataTarget(fc *fileCache, modPath string, pathCtx *decoder.PathC
 	return reference.Target{}, false
 }
 
-// declaredTarget finds the declaration of addr with the kind's scope.
+// declaredTarget finds the declaration of addr with the kind's scope: the
+// primary one, outside override files, when there is one. override.tf
+// sorts before variables.tf, so the first declaration found is often the
+// override, which OpenTofu merges into the primary one.
 func declaredTarget(pathCtx *decoder.PathContext, kind SymbolKind, addr lang.Address) (reference.Target, bool) {
+	var found reference.Target
+	ok := false
 	for _, target := range pathCtx.ReferenceTargets {
 		if target.RangePtr == nil || !target.Addr.Equals(addr) {
 			continue
 		}
-		if k, ok := kindOfTarget(target); ok && k == kind {
+		if k, isKind := kindOfTarget(target); !isKind || k != kind {
+			continue
+		}
+		if !isOverrideFile(target.RangePtr.Filename) {
 			return target, true
 		}
+		if !ok {
+			found, ok = target, true
+		}
 	}
-	return reference.Target{}, false
+	return found, ok
+}
+
+// primarySymbol returns the symbol declared by the primary declaration
+// when sym was found on its declaration in an override file, keeping the
+// cursor range, so that renaming from the override renames both.
+func primarySymbol(fc *fileCache, pathCtx *decoder.PathContext, sym *Symbol) (*Symbol, error) {
+	if sym.target.RangePtr == nil || !isOverrideFile(sym.target.RangePtr.Filename) {
+		return sym, nil
+	}
+	primary, ok := declaredTarget(pathCtx, sym.Kind, sym.Addr)
+	if !ok || isOverrideFile(primary.RangePtr.Filename) {
+		return sym, nil
+	}
+	psym, err := symbolFromTarget(fc, sym.Path, sym.Kind, primary)
+	if err != nil {
+		return nil, err
+	}
+	psym.CursorRange = sym.CursorRange
+	return psym, nil
 }
 
 func symbolFromOrigin(env Env, fc *fileCache, path lang.Path, pathCtx *decoder.PathContext, origin reference.Origin, pos hcl.Pos) (*Symbol, error) {
@@ -473,6 +513,62 @@ func symbolFromOrigin(env Env, fc *fileCache, path lang.Path, pathCtx *decoder.P
 		return sym, nil
 	}
 	return nil, nil
+}
+
+// moduleOutputAtPos returns the output of a local child module when pos
+// is on its name in a reference such as module.x[*].out, or nil.
+func moduleOutputAtPos(env Env, fc *fileCache, path lang.Path, file string, pos hcl.Pos) (*Symbol, error) {
+	body, _, err := fc.body(file)
+	if err != nil {
+		// not an error here: the origins below may still tell
+		return nil, nil
+	}
+	var addr lang.Address
+	var rng hcl.Range
+	_ = walkBodyTraversals(body, "", false, func(tr hcl.Traversal, _ bool) error {
+		if addr != nil || len(tr) < 3 {
+			return nil
+		}
+		if root, ok := tr[0].(hcl.TraverseRoot); !ok || root.Name != "module" {
+			return nil
+		}
+		call, ok := tr[1].(hcl.TraverseAttr)
+		if !ok {
+			return nil
+		}
+		out, ok := outputStep(tr)
+		if !ok {
+			return nil
+		}
+		outRng := out.SrcRange
+		if outRng.End.Byte-outRng.Start.Byte == len(out.Name)+1 {
+			outRng.Start = shiftPos(outRng.Start, 1)
+		}
+		if outRng.ContainsPos(pos) || outRng.End == pos {
+			addr = lang.Address{lang.RootStep{Name: "module"}, lang.AttrStep{Name: call.Name}, lang.AttrStep{Name: out.Name}}
+			rng = outRng
+		}
+		return nil
+	})
+	if addr == nil {
+		return nil, nil
+	}
+	return outputSymbolFromOrigin(env, fc, path, addr, rng)
+}
+
+// outputStep returns the output step of module.<call>.<output>,
+// module.<call>[<key>].<output> or module.<call>[*].<output>.
+func outputStep(tr hcl.Traversal) (hcl.TraverseAttr, bool) {
+	i := 2
+	switch tr[i].(type) {
+	case hcl.TraverseIndex, hcl.TraverseSplat:
+		i++
+	}
+	if i >= len(tr) {
+		return hcl.TraverseAttr{}, false
+	}
+	out, ok := tr[i].(hcl.TraverseAttr)
+	return out, ok
 }
 
 func outputSymbolFromOrigin(env Env, fc *fileCache, path lang.Path, addr lang.Address, cursorRng hcl.Range) (*Symbol, error) {
@@ -728,25 +824,10 @@ func Rename(ctx context.Context, env Env, sym *Symbol, newName string, opts Opti
 		return nil, err
 	}
 
-	// test files: run blocks refer to the module's objects, and variables
-	// blocks set its variables
-	for _, file := range moduleTestFiles(env, sym.Path.Path) {
-		body, _, err := fc.body(file)
-		if err != nil {
-			return nil, err
-		}
-		prefix := addrNames(sym.Addr)
-		_ = walkBodyTraversals(body, "", false, func(tr hcl.Traversal, _ bool) error {
-			if rng, ok := stepRangeIfPrefix(tr, prefix, nameIdx); ok {
-				edits.add(file, rng, newName)
-			}
-			return nil
-		})
-		if sym.Kind == KindVariable {
-			for _, rng := range testVariableKeys(body, sym.Name) {
-				edits.add(file, rng, newName)
-			}
-		}
+	// test files: run blocks refer to the objects of the module they run,
+	// and variables blocks set its variables
+	if err := renameInTestFiles(ctx, env, fc, sym, newName, edits); err != nil {
+		return nil, err
 	}
 
 	// tfvars keys and module input arguments of parent modules
@@ -802,8 +883,8 @@ func Rename(ctx context.Context, env Env, sym *Symbol, newName string, opts Opti
 				continue
 			}
 			for call := range calls {
-				if file, rng, ok := forExprOverModule(fc, p.Path, parentCtx, call); ok {
-					return nil, fmt.Errorf("module.%s is iterated by a for expression (%s:%d), whose uses of %s cannot be renamed safely; rename them by hand", call, fc.displayPath(file), rng.Start.Line, sym.Name)
+				if file, rng, how, ok := moduleObjectUse(fc, p.Path, parentCtx, call); ok {
+					return nil, fmt.Errorf("module.%s %s (%s:%d), whose uses of %s cannot be renamed safely; rename them by hand", call, how, fc.displayPath(file), rng.Start.Line, sym.Name)
 				}
 				err := walkModuleTraversals(fc, p.Path, parentCtx, func(file string, tr hcl.Traversal, _ bool) error {
 					if rng, ok := moduleOutputStepRange(tr, call, sym.Name); ok {
@@ -842,15 +923,7 @@ func moduleOutputStepRange(tr hcl.Traversal, call, output string) (hcl.Range, bo
 	if c, ok := tr[1].(hcl.TraverseAttr); !ok || c.Name != call {
 		return hcl.Range{}, false
 	}
-	i := 2
-	switch tr[i].(type) {
-	case hcl.TraverseIndex, hcl.TraverseSplat:
-		i++
-	}
-	if i >= len(tr) {
-		return hcl.Range{}, false
-	}
-	out, ok := tr[i].(hcl.TraverseAttr)
+	out, ok := outputStep(tr)
 	if !ok || out.Name != output {
 		return hcl.Range{}, false
 	}
@@ -861,36 +934,126 @@ func moduleOutputStepRange(tr hcl.Traversal, call, output string) (hcl.Range, bo
 	return rng, true
 }
 
-// forExprOverModule finds a for expression in the module at modPath whose
-// collection is module.<call> itself, so that the output is reached
-// through the iteration symbol, which rename cannot follow.
-func forExprOverModule(fc *fileCache, modPath string, pathCtx *decoder.PathContext, call string) (string, hcl.Range, bool) {
+// moduleObjectUse finds a place in the module at modPath where the object
+// of module.<call>, or of one of its instances, is used as a whole rather
+// than through one of its outputs: iterated by a for expression or by
+// for_each, or passed to a function, an output or a local value. An
+// output reached through such an object, as m.name in
+// [for m in values(module.x) : m.name], cannot be followed by rename. It
+// returns the file, the range of the reference and how it is used.
+func moduleObjectUse(fc *fileCache, modPath string, pathCtx *decoder.PathContext, call string) (string, hcl.Range, string, bool) {
 	for _, name := range sortedHCLFiles(pathCtx) {
 		file := filepath.Join(modPath, name)
 		body, _, err := fc.body(file)
 		if err != nil {
 			continue
 		}
-		var found *hcl.Range
-		hclsyntax.VisitAll(body, func(node hclsyntax.Node) hcl.Diagnostics {
-			fe, ok := node.(*hclsyntax.ForExpr)
-			if !ok || found != nil {
-				return nil
-			}
-			if coll, ok := fe.CollExpr.(*hclsyntax.ScopeTraversalExpr); ok && len(coll.Traversal) == 2 &&
-				coll.Traversal.RootName() == "module" {
-				if c, ok := coll.Traversal[1].(hcl.TraverseAttr); ok && c.Name == call {
-					rng := fe.SrcRange
-					found = &rng
-				}
-			}
-			return nil
-		})
-		if found != nil {
-			return file, *found, true
+		if rng, how, ok := moduleObjectUseInBody(body, "", call); ok {
+			return file, rng, how, true
 		}
 	}
-	return "", hcl.Range{}, false
+	return "", hcl.Range{}, "", false
+}
+
+func moduleObjectUseInBody(body *hclsyntax.Body, blockType, call string) (hcl.Range, string, bool) {
+	if blockType == "moved" || blockType == "removed" {
+		// addresses, not values
+		return hcl.Range{}, "", false
+	}
+	attrs := make([]*hclsyntax.Attribute, 0, len(body.Attributes))
+	for _, attr := range body.Attributes {
+		attrs = append(attrs, attr)
+	}
+	sort.Slice(attrs, func(i, j int) bool { return attrs[i].SrcRange.Start.Byte < attrs[j].SrcRange.Start.Byte })
+	for _, attr := range attrs {
+		if attr.Name == "depends_on" || (blockType == "import" && attr.Name == "to") {
+			continue
+		}
+		if rng, how, ok := moduleObjectUseInExpr(attr.Expr, call, attr.Name == "for_each"); ok {
+			return rng, how, true
+		}
+	}
+	for _, block := range body.Blocks {
+		if rng, how, ok := moduleObjectUseInBody(block.Body, block.Type, call); ok {
+			return rng, how, true
+		}
+	}
+	return hcl.Range{}, "", false
+}
+
+func moduleObjectUseInExpr(expr hclsyntax.Expression, call string, forEach bool) (hcl.Range, string, bool) {
+	// references which reach an output after all: the source of a splat
+	// or of a dynamic index followed by an attribute, and arguments of
+	// functions which do not read the outputs
+	throughOutput := map[hcl.Range]bool{}
+	var forColls []hcl.Range
+	hclsyntax.VisitAll(expr, func(node hclsyntax.Node) hcl.Diagnostics {
+		switch e := node.(type) {
+		case *hclsyntax.SplatExpr:
+			if each, ok := e.Each.(*hclsyntax.RelativeTraversalExpr); ok && startsWithAttr(each.Traversal) {
+				if _, ok := each.Source.(*hclsyntax.AnonSymbolExpr); ok {
+					throughOutput[e.Source.Range()] = true
+				}
+			}
+		case *hclsyntax.RelativeTraversalExpr:
+			if idx, ok := e.Source.(*hclsyntax.IndexExpr); ok && startsWithAttr(e.Traversal) {
+				throughOutput[idx.Collection.Range()] = true
+			}
+		case *hclsyntax.FunctionCallExpr:
+			if e.Name == "length" || e.Name == "keys" {
+				for _, arg := range e.Args {
+					throughOutput[arg.Range()] = true
+				}
+			}
+		case *hclsyntax.ForExpr:
+			forColls = append(forColls, e.CollExpr.Range())
+		}
+		return nil
+	})
+
+	var found *hcl.Range
+	how := ""
+	hclsyntax.VisitAll(expr, func(node hclsyntax.Node) hcl.Diagnostics {
+		st, ok := node.(*hclsyntax.ScopeTraversalExpr)
+		if !ok || found != nil || len(st.Traversal) < 2 || st.Traversal.RootName() != "module" {
+			return nil
+		}
+		if c, ok := st.Traversal[1].(hcl.TraverseAttr); !ok || c.Name != call {
+			return nil
+		}
+		if len(st.Traversal) >= 3 {
+			if _, ok := outputStep(st.Traversal); ok {
+				return nil
+			}
+		}
+		if throughOutput[st.SrcRange] {
+			return nil
+		}
+		rng := st.SrcRange
+		found = &rng
+		how = "is used as a whole object"
+		for _, coll := range forColls {
+			if coll.ContainsOffset(rng.Start.Byte) {
+				how = "is iterated by a for expression"
+			}
+		}
+		if forEach && how != "is iterated by a for expression" {
+			how = "is iterated by for_each"
+		}
+		return nil
+	})
+	if found == nil {
+		return hcl.Range{}, "", false
+	}
+	return *found, how, true
+}
+
+func startsWithAttr(tr hcl.Traversal) bool {
+	if len(tr) == 0 {
+		return false
+	}
+	_, ok := tr[0].(hcl.TraverseAttr)
+	return ok
 }
 
 // isOverrideFile reports whether a configuration file is an override
@@ -971,18 +1134,231 @@ func moduleTestFiles(env Env, modPath string) []string {
 	return files
 }
 
-// testVariableKeys returns the ranges of the keys called name in the
-// variables blocks of a test file, at the top level and in run blocks.
-func testVariableKeys(body *hclsyntax.Body, name string) []hcl.Range {
+// testRun is a run block of a test file and the module it runs.
+type testRun struct {
+	block *hclsyntax.Block
+	name  string
+	// module is the directory of the module the run runs: the module
+	// holding the test file, or the local source of the run's module
+	// block. It is "" for a module that is not local.
+	module string
+}
+
+// testRuns returns the run blocks of a test file of the module at root.
+// A module block's source is relative to root, where tofu test runs.
+func testRuns(body *hclsyntax.Body, root string) []testRun {
+	runs := make([]testRun, 0)
+	for _, block := range body.Blocks {
+		if block.Type != "run" {
+			continue
+		}
+		run := testRun{block: block, module: filepath.Clean(root)}
+		if len(block.Labels) > 0 {
+			run.name = block.Labels[0]
+		}
+		for _, nested := range block.Body.Blocks {
+			if nested.Type != "module" {
+				continue
+			}
+			run.module = ""
+			src, ok := nested.Body.Attributes["source"]
+			if !ok {
+				continue
+			}
+			v, diags := src.Expr.Value(nil)
+			if diags.HasErrors() || !v.IsKnown() || v.IsNull() || v.Type() != cty.String {
+				continue
+			}
+			if s := v.AsString(); strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
+				run.module = filepath.Clean(filepath.Join(root, filepath.FromSlash(s)))
+			}
+		}
+		runs = append(runs, run)
+	}
+	return runs
+}
+
+// renameInTestFiles renames the symbol in the test files of every module
+// whose runs run the symbol's module, including its own test files. A run
+// block refers to the objects of the module it runs, and a run's variables
+// block sets that module's variables, so runs of other modules are left
+// alone. Outside run blocks, a test file belongs to the module holding it.
+func renameInTestFiles(ctx context.Context, env Env, fc *fileCache, sym *Symbol, newName string, edits *editSet) error {
+	symDir := filepath.Clean(sym.Path.Path)
+	roots := []string{symDir}
+	for _, p := range env.PathReader.Paths(ctx) {
+		if dir := filepath.Clean(p.Path); p.LanguageID == sym.Path.LanguageID && dir != symDir {
+			roots = append(roots, dir)
+		}
+	}
+	sort.Strings(roots[1:])
+
+	nameIdx := sym.Kind.nameIndex()
+	prefix := addrNames(sym.Addr)
+	rename := func(file string, body *hclsyntax.Body) {
+		_ = walkBodyTraversals(body, "", false, func(tr hcl.Traversal, _ bool) error {
+			if rng, ok := stepRangeIfPrefix(tr, prefix, nameIdx); ok {
+				edits.add(file, rng, newName)
+			}
+			return nil
+		})
+	}
+
+	seen := map[string]bool{}
+	for _, root := range roots {
+		for _, file := range moduleTestFiles(env, root) {
+			if seen[file] {
+				continue
+			}
+			seen[file] = true
+			body, _, err := fc.body(file)
+			if err != nil {
+				return err
+			}
+			runs := testRuns(body, root)
+			symRuns := map[string]bool{}
+			for _, run := range runs {
+				if run.module == symDir {
+					symRuns[run.name] = true
+				}
+			}
+			ownFile := root == symDir
+			if !ownFile && len(symRuns) == 0 {
+				continue
+			}
+
+			// the file's variables are given to every run: they are the
+			// symbol's when a run of its module reads them
+			var fileKeys []hcl.Range
+			fileVars := ownFile
+			if sym.Kind == KindVariable {
+				fileKeys = variablesKeys(body, sym.Name)
+				if len(fileKeys) > 0 {
+					fileVars = len(symRuns) > 0 || len(runs) == 0
+				}
+				if len(fileKeys) > 0 && fileVars {
+					if other, ok := runReadingFileVariable(env, runs, symDir, sym.Name, sym.Path.LanguageID); ok {
+						module := "a module that is not local"
+						if other.module != "" {
+							module = fc.displayPath(other.module)
+						}
+						return fmt.Errorf("%s sets %s for every run, and run %q, which runs %s, reads it too; rename it there by hand", fc.displayPath(file), sym.Name, other.name, module)
+					}
+					for _, rng := range fileKeys {
+						edits.add(file, rng, newName)
+					}
+				}
+			}
+
+			if ownFile && fileVars {
+				outside := &hclsyntax.Body{Attributes: body.Attributes}
+				for _, block := range body.Blocks {
+					if block.Type != "run" {
+						outside.Blocks = append(outside.Blocks, block)
+					}
+				}
+				rename(file, outside)
+			}
+			for _, run := range runs {
+				if run.module == symDir {
+					// assertions, expect_failures and overrides
+					inside := &hclsyntax.Body{Attributes: run.block.Body.Attributes}
+					for _, nested := range run.block.Body.Blocks {
+						if nested.Type != "variables" && nested.Type != "module" {
+							inside.Blocks = append(inside.Blocks, nested)
+						}
+					}
+					rename(file, inside)
+				}
+				if ownFile && sym.Kind == KindVariable {
+					// var.x in the values of a run's variables reads the
+					// variables given to tofu test for this module
+					for _, nested := range run.block.Body.Blocks {
+						if nested.Type == "variables" {
+							rename(file, &hclsyntax.Body{Attributes: nested.Body.Attributes})
+						}
+					}
+				}
+			}
+
+			if sym.Kind == KindOutput && len(symRuns) > 0 {
+				// run.<name>.<output> of a run of the symbol's module
+				_ = walkBodyTraversals(body, "", false, func(tr hcl.Traversal, _ bool) error {
+					if rng, ok := runOutputStepRange(tr, symRuns, sym.Name); ok {
+						edits.add(file, rng, newName)
+					}
+					return nil
+				})
+			}
+
+			if sym.Kind == KindVariable {
+				// a run's own variables set those of the module it runs
+				for _, run := range runs {
+					if run.module == symDir {
+						for _, rng := range variablesKeys(run.block.Body, sym.Name) {
+							edits.add(file, rng, newName)
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// runReadingFileVariable returns a run of another module than dir which
+// reads the variable name from the variables block of the test file: the
+// module declares the variable (or may, when it is not indexed) and the
+// run does not set it itself.
+func runReadingFileVariable(env Env, runs []testRun, dir, name, languageID string) (testRun, bool) {
+	addr := lang.Address{lang.RootStep{Name: "var"}, lang.AttrStep{Name: name}}
+	for _, run := range runs {
+		if run.module == dir || len(variablesKeys(run.block.Body, name)) > 0 {
+			continue
+		}
+		if run.module != "" {
+			pathCtx, err := env.PathReader.PathContext(lang.Path{Path: run.module, LanguageID: languageID})
+			if err == nil {
+				if _, declared := declaredTarget(pathCtx, KindVariable, addr); !declared {
+					continue
+				}
+			}
+		}
+		return run, true
+	}
+	return testRun{}, false
+}
+
+// runOutputStepRange returns the range of the output name (without the
+// dot) in run.<run>.<output>, for one of the runs.
+func runOutputStepRange(tr hcl.Traversal, runs map[string]bool, output string) (hcl.Range, bool) {
+	if len(tr) < 3 || tr.RootName() != "run" {
+		return hcl.Range{}, false
+	}
+	if r, ok := tr[1].(hcl.TraverseAttr); !ok || !runs[r.Name] {
+		return hcl.Range{}, false
+	}
+	out, ok := tr[2].(hcl.TraverseAttr)
+	if !ok || out.Name != output {
+		return hcl.Range{}, false
+	}
+	rng := out.SrcRange
+	if rng.End.Byte-rng.Start.Byte == len(out.Name)+1 {
+		rng.Start = shiftPos(rng.Start, 1)
+	}
+	return rng, true
+}
+
+// variablesKeys returns the ranges of the keys called name in the
+// variables blocks directly in body: a test file's or a run block's.
+func variablesKeys(body *hclsyntax.Body, name string) []hcl.Range {
 	var ranges []hcl.Range
 	for _, block := range body.Blocks {
-		switch block.Type {
-		case "variables":
-			if attr, ok := block.Body.Attributes[name]; ok {
-				ranges = append(ranges, attr.NameRange)
-			}
-		case "run":
-			ranges = append(ranges, testVariableKeys(block.Body, name)...)
+		if block.Type != "variables" {
+			continue
+		}
+		if attr, ok := block.Body.Attributes[name]; ok {
+			ranges = append(ranges, attr.NameRange)
 		}
 	}
 	return ranges

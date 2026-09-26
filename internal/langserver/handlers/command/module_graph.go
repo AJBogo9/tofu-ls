@@ -243,7 +243,7 @@ func buildModuleGraph(modPath string, files map[string]*hcl.File, childFiles mod
 	byID := make(map[string]*graphBlock)
 	for _, name := range filenames {
 		file := files[name]
-		if file == nil {
+		if file == nil || shadowedByTofuFile(name, files) {
 			continue
 		}
 		body, ok := file.Body.(*hclsyntax.Body)
@@ -298,10 +298,41 @@ func buildModuleGraph(modPath string, files map[string]*hcl.File, childFiles mod
 			})
 		}
 
-		if gb.expr != nil {
-			for _, traversal := range hclsyntax.Variables(gb.expr) {
-				addRef("", traversal, false)
+		// a provider reference, such as aws.west, null.by_key (null is a
+		// keyword) or random.by_key[var.k], whose key reads values
+		addProviderRef := func(attrPath string, expr hclsyntax.Expression) {
+			addr, key := providerReference(expr)
+			if addr != nil {
+				addRef(attrPath, addr, true)
 			}
+			if key != nil {
+				for _, traversal := range hclsyntax.Variables(key) {
+					addRef(attrPath, traversal, false)
+				}
+			}
+		}
+		addValueRefs := func(attrPath string, expr hclsyntax.Expression) {
+			for _, traversal := range hclsyntax.Variables(expr) {
+				addRef(attrPath, traversal, false)
+			}
+			// module.x[*].out and module.x[var.k].out read the output out,
+			// which the variables of the expression (module.x) do not say
+			for _, traversal := range instanceTraversals(expr) {
+				if name, ok := moduleOutputName(traversal); ok {
+					if targetID, ok := graphTargetID(traversal, false); ok && strings.HasPrefix(targetID, "module.") {
+						if _, ok := byID[targetID]; ok {
+							if outputsUsed[targetID] == nil {
+								outputsUsed[targetID] = make(map[string]bool)
+							}
+							outputsUsed[targetID][name] = true
+						}
+					}
+				}
+			}
+		}
+
+		if gb.expr != nil {
+			addValueRefs("", gb.expr)
 			continue
 		}
 		walkGraphBody(gb.body, "", func(attrPath string, expr hclsyntax.Expression) {
@@ -310,18 +341,16 @@ func buildModuleGraph(modPath string, files map[string]*hcl.File, childFiles mod
 				// (aws.child = aws.parent); only the values are references here
 				if obj, ok := expr.(*hclsyntax.ObjectConsExpr); ok {
 					for _, item := range obj.Items {
-						for _, traversal := range hclsyntax.Variables(item.ValueExpr) {
-							addRef(attrPath, traversal, true)
-						}
+						addProviderRef(attrPath, item.ValueExpr)
 					}
 					return
 				}
 			}
-			providerRef := (gb.node.Kind == "resource" || gb.node.Kind == "data") && attrPath == "provider" ||
-				gb.node.Kind == "module" && attrPath == "providers"
-			for _, traversal := range hclsyntax.Variables(expr) {
-				addRef(attrPath, traversal, providerRef)
+			if (gb.node.Kind == "resource" || gb.node.Kind == "data" || gb.node.Kind == "ephemeral") && attrPath == "provider" {
+				addProviderRef(attrPath, expr)
+				return
 			}
+			addValueRefs(attrPath, expr)
 		})
 	}
 
@@ -385,6 +414,10 @@ func declarationsInBody(body *hclsyntax.Body, file *hcl.File, fileURI string) []
 		case block.Type == "data" && len(block.Labels) == 2:
 			node.Kind, node.Type, node.Name = "data", block.Labels[0], block.Labels[1]
 			node.ID = "data." + block.Labels[0] + "." + block.Labels[1]
+			node.Repeat = repeatMode(block.Body)
+		case block.Type == "ephemeral" && len(block.Labels) == 2:
+			node.Kind, node.Type, node.Name = "ephemeral", block.Labels[0], block.Labels[1]
+			node.ID = "ephemeral." + block.Labels[0] + "." + block.Labels[1]
 			node.Repeat = repeatMode(block.Body)
 		case block.Type == "module" && len(block.Labels) == 1:
 			node.Kind, node.Name, node.ID = "module", block.Labels[0], "module."+block.Labels[0]
@@ -485,7 +518,7 @@ func graphTargetID(traversal hcl.Traversal, providerRef bool) (string, bool) {
 			return "", false
 		}
 		return root + "." + name, true
-	case "data":
+	case "data", "ephemeral":
 		typ, ok := attrAt(1)
 		if !ok {
 			return "", false
@@ -494,7 +527,7 @@ func graphTargetID(traversal hcl.Traversal, providerRef bool) (string, bool) {
 		if !ok {
 			return "", false
 		}
-		return "data." + typ + "." + name, true
+		return root + "." + typ + "." + name, true
 	case "each", "count", "self", "path", "terraform":
 		return "", false
 	}
@@ -506,11 +539,12 @@ func graphTargetID(traversal hcl.Traversal, providerRef bool) (string, bool) {
 }
 
 // moduleOutputName returns the output a module reference reads:
-// "url" for module.app.url and for module.app[0].url or module.app["a"].url.
+// "url" for module.app.url and for module.app[0].url, module.app["a"].url
+// or module.app[*].url.
 func moduleOutputName(traversal hcl.Traversal) (string, bool) {
 	for i := 2; i < len(traversal); i++ {
 		switch step := traversal[i].(type) {
-		case hcl.TraverseIndex:
+		case hcl.TraverseIndex, hcl.TraverseSplat:
 			continue
 		case hcl.TraverseAttr:
 			return step.Name, true
@@ -588,6 +622,77 @@ func moduleGraphChildOf(gb *graphBlock, outputsUsed map[string]bool, childFiles 
 		child.Outputs = append(child.Outputs, port)
 	}
 	return child
+}
+
+// providerReference splits a provider reference into the provider's
+// address and the key of an instance, if any: aws.west, null.by_key
+// (null parses as the keyword, which AbsTraversalForExpr turns back into
+// a name) or random.by_key[var.k].
+func providerReference(expr hclsyntax.Expression) (hcl.Traversal, hclsyntax.Expression) {
+	var key hclsyntax.Expression
+	if idx, ok := expr.(*hclsyntax.IndexExpr); ok {
+		expr, key = idx.Collection, idx.Key
+	}
+	addr, diags := hcl.AbsTraversalForExpr(expr)
+	if diags.HasErrors() {
+		return nil, key
+	}
+	return addr, key
+}
+
+// instanceTraversals returns the whole traversals of the splats and the
+// dynamic indexes in expr, such as module.app[*].url and
+// module.app[var.k].url, which the syntax splits in two. The key of a
+// splat or a dynamic index is left unknown.
+func instanceTraversals(expr hclsyntax.Expression) []hcl.Traversal {
+	traversals := make([]hcl.Traversal, 0)
+	hclsyntax.VisitAll(expr, func(node hclsyntax.Node) hcl.Diagnostics {
+		switch e := node.(type) {
+		case *hclsyntax.SplatExpr:
+			src, ok := e.Source.(*hclsyntax.ScopeTraversalExpr)
+			if !ok {
+				return nil
+			}
+			each, ok := e.Each.(*hclsyntax.RelativeTraversalExpr)
+			if !ok {
+				return nil
+			}
+			if _, ok := each.Source.(*hclsyntax.AnonSymbolExpr); !ok {
+				return nil
+			}
+			tr := append(hcl.Traversal{}, src.Traversal...)
+			tr = append(tr, hcl.TraverseSplat{SrcRange: e.MarkerRange})
+			traversals = append(traversals, append(tr, each.Traversal...))
+		case *hclsyntax.RelativeTraversalExpr:
+			idx, ok := e.Source.(*hclsyntax.IndexExpr)
+			if !ok {
+				return nil
+			}
+			coll, ok := idx.Collection.(*hclsyntax.ScopeTraversalExpr)
+			if !ok {
+				return nil
+			}
+			tr := append(hcl.Traversal{}, coll.Traversal...)
+			tr = append(tr, hcl.TraverseIndex{Key: cty.DynamicVal, SrcRange: idx.BracketRange})
+			traversals = append(traversals, append(tr, e.Traversal...))
+		}
+		return nil
+	})
+	return traversals
+}
+
+// shadowedByTofuFile reports whether a .tf file (or .tf.json) has a .tofu
+// copy (or .tofu.json), which OpenTofu reads instead of it.
+func shadowedByTofuFile(name string, files map[string]*hcl.File) bool {
+	for _, ext := range []string{".tf", ".tf.json"} {
+		if strings.HasSuffix(name, ext) {
+			tofu := strings.TrimSuffix(name, ext) + strings.Replace(ext, ".tf", ".tofu", 1)
+			if f, ok := files[tofu]; ok && f != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isModuleMetaArgument(name string) bool {

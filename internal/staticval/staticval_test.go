@@ -1030,6 +1030,63 @@ locals {
 	}
 }
 
+func TestAddCallers_rootCalledByItsExamplesStaysRoot(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"main.tf": `variable "name" {
+  default = "default-name"
+}
+locals {
+  greeting = "hello-${var.name}"
+}
+`,
+		"examples/basic/main.tf": `module "this" {
+  source = "../../"
+  name   = "example"
+}
+`,
+		"modules/app/main.tf": `variable "name" {}
+`,
+		"caller/main.tf": `module "app" {
+  source = "../modules/app"
+  name   = "from-caller"
+}
+`,
+	})
+	examples, err := LoadModule(osFS{}, filepath.Join(root, "examples", "basic"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller, err := LoadModule(osFS{}, filepath.Join(root, "caller"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexed := func(dir string) []Caller {
+		switch dir {
+		case root:
+			return []Caller{{Parent: examples, Name: "this"}}
+		case filepath.Join(root, "modules", "app"):
+			return []Caller{{Parent: caller, Name: "app"}}
+		}
+		return nil
+	}
+
+	// no tfvars and no .terraform, called only from below: a root
+	ev := treeEvaluator(t, root, indexed)
+	if ev.Module().RootPath != "" {
+		t.Fatalf("a module called only by its own examples was classified as a child of %s", ev.Module().RootPath)
+	}
+	r := ev.EvalLocal("greeting")
+	if !r.IsKnown() || r.Value.AsString() != "hello-default-name" {
+		t.Fatalf("unexpected local.greeting: %#v", r)
+	}
+
+	// a caller beside it still makes a module a child
+	child := treeEvaluator(t, filepath.Join(root, "modules", "app"), indexed)
+	if child.Module().RootPath != filepath.Join(root, "caller") {
+		t.Fatalf("expected modules/app to be a child of caller, got root %q", child.Module().RootPath)
+	}
+}
+
 func TestVarsFileHover_nonNullableNull(t *testing.T) {
 	root := writeTree(t, map[string]string{
 		"main.tf":          "variable \"nn\" {\n  default  = \"nn-default\"\n  nullable = false\n}\n",

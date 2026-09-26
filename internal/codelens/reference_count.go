@@ -58,6 +58,12 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 
 		// variables and locals no expression uses, read from the syntax
 		var unused map[string]bool
+		unusedInSyntax := func() map[string]bool {
+			if unused == nil {
+				unused = unusedNames(localCtx.Files)
+			}
+			return unused
+		}
 
 		for rng, refTargets := range dedupedTargets {
 			if err := ctx.Err(); err != nil {
@@ -105,7 +111,7 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 			lenses = append(lenses, lang.CodeLens{
 				Range: rng,
 				Command: lang.Command{
-					Title: getTitle("reference", "references", originCount) + nonUseSuffix(seen),
+					Title: getTitle("reference", "references", originCount) + checkedNonUseSuffix(seen, refTargets[0].Addr.String(), unusedInSyntax),
 					ID:    showReferencesCmdId,
 					Arguments: []lang.CommandArgument{
 						Position(ilsp.HCLPosToLSP(hclPos)),
@@ -180,6 +186,17 @@ func nonUseSuffix(kinds map[originKey]string) string {
 		return " (" + names[0] + " only)"
 	}
 	return " (" + strings.Join(names, ", ") + " only)"
+}
+
+// checkedNonUseSuffix is nonUseSuffix, left out when the module's syntax
+// uses the symbol (addr) somewhere the decoder does not see, such as a
+// block without a schema: " (tfvars only)" would then be wrong.
+func checkedNonUseSuffix(kinds map[originKey]string, addr string, unused func() map[string]bool) string {
+	suffix := nonUseSuffix(kinds)
+	if suffix == "" || unused()[addr] {
+		return suffix
+	}
+	return ""
 }
 
 // originKey identifies an origin across the targets of one lens.

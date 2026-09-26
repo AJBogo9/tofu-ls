@@ -642,3 +642,40 @@ func TestTokenModifiersLegend_referenceKinds(t *testing.T) {
 		}
 	}
 }
+
+func TestTokenEncoder_emojiLine(t *testing.T) {
+	// a = "🚀 ${var.x}": the emoji is 4 bytes, 2 UTF-16 code units and
+	// 1 HCL column, so neither bytes nor columns give LSP characters
+	src := []byte("a = \"\U0001F680 ${var.x}\"\n")
+	rng := func(startCol, startByte, endCol, endByte int) hcl.Range {
+		return hcl.Range{
+			Filename: "test.tf",
+			Start:    hcl.Pos{Line: 1, Column: startCol, Byte: startByte},
+			End:      hcl.Pos{Line: 1, Column: endCol, Byte: endByte},
+		}
+	}
+	te := &TokenEncoder{
+		Lines: source.MakeSourceLines("test.tf", src),
+		Tokens: []lang.SemanticToken{
+			{Type: lang.TokenAttrName, Range: rng(1, 0, 2, 1)},
+			// the string part "🚀 before the interpolation
+			{Type: lang.TokenAttrName, Range: rng(5, 4, 8, 10)},
+			{Type: lang.TokenAttrName, Range: rng(10, 12, 13, 15)},
+			{Type: lang.TokenAttrName, Range: rng(14, 16, 15, 17)},
+		},
+		ClientCaps: protocol.SemanticTokensClientCapabilities{
+			TokenTypes:     serverTokenTypes.AsStrings(),
+			TokenModifiers: serverTokenModifiers.AsStrings(),
+		},
+	}
+	data := te.Encode()
+	expectedData := []uint32{
+		0, 0, 1, 9, 0,
+		0, 4, 4, 9, 0,
+		0, 6, 3, 9, 0,
+		0, 4, 1, 9, 0,
+	}
+	if diff := cmp.Diff(expectedData, data); diff != "" {
+		t.Fatalf("unexpected encoded data.\nexpected: %#v\ngiven:    %#v", expectedData, data)
+	}
+}

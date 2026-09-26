@@ -313,6 +313,84 @@ check "workers" {
 		},
 	})
 
+	tests = append(tests, struct {
+		name      string
+		files     map[string]string
+		wantNodes []string
+		wantEdges []string
+	}{
+		name: "provider instances by key, a provider named null, ephemeral resources",
+		files: map[string]string{
+			"main.tf": `variable "k" {}
+
+provider "random" {
+  alias    = "by"
+  for_each = toset(["a"])
+}
+
+provider "null" {
+  alias    = "by"
+  for_each = toset(["a"])
+}
+
+resource "random_pet" "p" {
+  provider = random.by[var.k]
+}
+
+resource "null_resource" "n" {
+  provider = null.by[var.k]
+}
+
+ephemeral "random_password" "pw" {
+  length = var.len
+}
+
+variable "len" {}
+
+locals {
+  secret = ephemeral.random_password.pw.result
+}
+`,
+		},
+		wantNodes: []string{
+			"variable var.k @main.tf:1",
+			"provider provider.random.by @main.tf:3 type=random",
+			"provider provider.null.by @main.tf:8 type=null",
+			"resource random_pet.p @main.tf:13 type=random_pet",
+			"resource null_resource.n @main.tf:17 type=null_resource",
+			"ephemeral ephemeral.random_password.pw @main.tf:21 type=random_password",
+			"variable var.len @main.tf:25",
+			`local local.secret @main.tf:28 detail="ephemeral.random_password.pw.result"`,
+		},
+		wantEdges: []string{
+			"ephemeral.random_password.pw -> local.secret [: ephemeral.random_password.pw.result @28:12]",
+			"provider.null.by -> null_resource.n [provider: null.by @18:14]",
+			"provider.random.by -> random_pet.p [provider: random.by @14:14]",
+			"var.k -> null_resource.n [provider: var.k @18:22]",
+			"var.k -> random_pet.p [provider: var.k @14:24]",
+			"var.len -> ephemeral.random_password.pw [length: var.len @22:12]",
+		},
+	}, struct {
+		name      string
+		files     map[string]string
+		wantNodes []string
+		wantEdges []string
+	}{
+		name: "a .tofu file shadows the .tf file of the same name",
+		files: map[string]string{
+			"main.tf":   "variable \"stage\" {\n  default = \"tf\"\n}\n",
+			"main.tofu": "variable \"stage\" {\n  default = \"tofu\"\n}\n",
+			"other.tf":  "output \"o\" {\n  value = var.stage\n}\n",
+		},
+		wantNodes: []string{
+			"variable var.stage @main.tofu:1",
+			"output output.o @other.tf:1",
+		},
+		wantEdges: []string{
+			"var.stage -> output.o [value: var.stage @2:11]",
+		},
+	})
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			modPath := t.TempDir()
@@ -460,5 +538,53 @@ func Test_moduleGraphParseErrors(t *testing.T) {
 	}
 	if moduleGraphParseErrors(modPath, ast.ModDiags{"ok.tf": nil}) != nil {
 		t.Error("a module without errors should report none")
+	}
+}
+
+func Test_buildModuleGraph_outputsThroughSplatsAndKeys(t *testing.T) {
+	modPath := t.TempDir()
+	files := parseGraphFiles(t, map[string]string{
+		"main.tf": `module "app" {
+  source = "./app"
+  count  = 2
+}
+
+locals {
+  k = 0
+}
+
+output "urls" {
+  value = module.app[*].url
+}
+
+output "name" {
+  value = module.app[local.k].name
+}
+`,
+	})
+	childDir := filepath.Join(modPath, "app")
+	childFiles := parseGraphFiles(t, map[string]string{
+		"outputs.tf": "output \"url\" {\n  value = \"u\"\n}\noutput \"name\" {\n  value = \"n\"\n}\n",
+	})
+	resolve := func(name, source string) (string, map[string]*hcl.File) {
+		return childDir, childFiles
+	}
+
+	got := buildModuleGraph(modPath, files, resolve)
+	var child *moduleGraphChild
+	for _, n := range got.Nodes {
+		if n.ID == "module.app" {
+			child = n.Child
+		}
+	}
+	if child == nil {
+		t.Fatal("expected a child boundary for module.app")
+	}
+	names := make([]string, 0)
+	for _, port := range child.Outputs {
+		names = append(names, port.Name)
+	}
+	if diff := cmp.Diff([]string{"name", "url"}, names); diff != "" {
+		t.Errorf("outputs mismatch: %s", diff)
 	}
 }
