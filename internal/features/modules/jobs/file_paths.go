@@ -17,10 +17,6 @@ import (
 	globalAst "github.com/opentofu/tofu-ls/internal/tofu/ast"
 )
 
-// TemplateFileMissingCode is the code of the warning for a file function
-// path that names no file.
-const TemplateFileMissingCode = "template-file-missing"
-
 // MissingPathFiles warns about file function paths, as in templatefile()
 // or file(), that are static and name no file, and fileset() directories
 // that do not exist. fileexists() is never reported.
@@ -93,9 +89,9 @@ func MissingPathFiles(ctx context.Context, fs ReadOnlyFS, modStore *state.Module
 				Summary:  summary,
 				Detail:   detail,
 				Subject:  &rng,
-				Extra: ilsp.DiagnosticCode{
-					Code: TemplateFileMissingCode,
-					Data: map[string]any{
+				Extra: ilsp.CodedDiagnostic{
+					Code: ilsp.CodeTemplateFileMissing,
+					Data: map[string]interface{}{
 						"path":     resolved,
 						"function": call.Function,
 					},

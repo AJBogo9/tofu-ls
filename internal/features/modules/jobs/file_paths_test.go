@@ -115,7 +115,7 @@ func TestMissingPathFiles(t *testing.T) {
 			}
 			got := make([]string, 0)
 			for _, d := range mod.ModuleDiagnostics[ast.FilePathsSource]["main.tf"] {
-				code := d.Extra.(ilsp.DiagnosticCode)
+				code := d.Extra.(ilsp.CodedDiagnostic)
 				got = append(got, fmt.Sprintf("%d:%d %s %s", d.Subject.Start.Line, d.Subject.Start.Column, code.Code, d.Summary))
 				if code.Data["path"] == "" || code.Data["function"] == "" {
 					t.Fatalf("missing data: %#v", code.Data)
