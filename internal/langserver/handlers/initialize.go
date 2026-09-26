@@ -109,6 +109,7 @@ func (svc *service) Initialize(ctx context.Context, params lsp.InitializeParams)
 	validationOptions.UnusedSymbols = out.Options.Diagnostics.UnusedSymbols
 	lsctx.SetValidationOptions(ctx, validationOptions)
 	svc.inlayHints = out.Options.InlayHints
+	svc.setValueInputs(out.Options.Values)
 
 	if len(out.UnusedKeys) > 0 {
 		jrpc2.ServerFromContext(ctx).Notify(ctx, "window/showMessage", &lsp.ShowMessageParams{

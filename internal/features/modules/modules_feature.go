@@ -25,6 +25,7 @@ import (
 	"github.com/opentofu/tofu-ls/internal/langserver/diagnostics"
 	"github.com/opentofu/tofu-ls/internal/registry"
 	globalState "github.com/opentofu/tofu-ls/internal/state"
+	"github.com/opentofu/tofu-ls/internal/staticval"
 )
 
 // ModulesFeature groups everything related to modules. Its internal
@@ -42,6 +43,24 @@ type ModulesFeature struct {
 
 	// reference contexts of modules, kept across requests
 	referenceCache *refcache.Cache[state.ModuleRecord]
+
+	// inputs are the -var-file files and TF_VAR_ variables chosen for
+	// static values; nil chooses none
+	inputs *staticval.InputsStore
+}
+
+// SetInputs sets the -var-file files and TF_VAR_ variables that the
+// static value checks use.
+func (f *ModulesFeature) SetInputs(inputs *staticval.InputsStore) {
+	f.inputs = inputs
+}
+
+// inputsSource returns the inputs for the jobs, nil when none are set.
+func (f *ModulesFeature) inputsSource() staticval.InputsSource {
+	if f.inputs == nil {
+		return nil
+	}
+	return f.inputs
 }
 
 func NewModulesFeature(eventbus *eventbus.EventBus, stateStore *globalState.StateStore, fs jobs.ReadOnlyFS, rootFeature fdecoder.RootReader, registryClient registry.Client) (*ModulesFeature, error) {

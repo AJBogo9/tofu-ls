@@ -308,13 +308,13 @@ func (ev *Evaluator) variableHover(name string, ref *hclsyntax.ScopeTraversalExp
 		fmt.Fprintf(&b, "**Value** none: %s\n\n", ev.refused.Reason)
 	case !ok && len(v.Assignments) > 0 && v.Assignments[len(v.Assignments)-1].Err != "":
 		a := v.Assignments[len(v.Assignments)-1]
-		fmt.Fprintf(&b, "**Value** invalid: the value in `%s` does not match the type (%s)\n\n", a.File, a.Err)
+		fmt.Fprintf(&b, "**Value** invalid: the value in %s does not match the type (%s)\n\n", sourceName(&a), a.Err)
 	case !ok:
 		fmt.Fprintf(&b, "**Value** unknown: no default and no tfvars value. Set it with `-var`, `-var-file` or `TF_VAR_%s`.\n\n", name)
 	default:
 		from := "the default"
-		if source != "default" {
-			from = "`" + source + "`"
+		if a := v.assignment(source); source != "default" && a != nil {
+			from = sourceName(a)
 		}
 		switch failures := ev.failures[name]; {
 		case len(failures) > 0:
@@ -343,7 +343,7 @@ func (ev *Evaluator) variableHover(name string, ref *hclsyntax.ScopeTraversalExp
 
 	for i, a := range v.Assignments {
 		if a.Err != "" && i < len(v.Assignments)-1 {
-			fmt.Fprintf(&b, "Warning: the value in `%s` does not match the type (%s)\n\n", a.File, a.Err)
+			fmt.Fprintf(&b, "Warning: the value in %s does not match the type (%s)\n\n", sourceName(&a), a.Err)
 		}
 	}
 
@@ -373,6 +373,18 @@ func (ev *Evaluator) variableHover(name string, ref *hclsyntax.ScopeTraversalExp
 	}
 	fmt.Fprintf(&b, "_Declared in `%s`_", v.File)
 	return b.String(), true
+}
+
+// sourceName names where an assignment comes from: a tfvars file, a file
+// of the selected environment (-var-file), or a TF_VAR_ variable.
+func sourceName(a *Assignment) string {
+	switch a.Kind {
+	case FromVarFile:
+		return "`" + a.File + "` (selected environment)"
+	case FromEnvironment:
+		return "`" + a.File + "` (environment)"
+	}
+	return "`" + a.File + "`"
 }
 
 // redactedText is what is shown instead of a value of v.
@@ -465,11 +477,11 @@ func (ev *Evaluator) overriddenSources(v *Variable, winner string) string {
 		}
 		switch {
 		case a.Value.IsNull() && !v.Nullable && winner == "default":
-			parts = append(parts, fmt.Sprintf("`%s` sets `null`, which the default replaces because the variable is not nullable", a.File))
+			parts = append(parts, fmt.Sprintf("%s sets `null`, which the default replaces because the variable is not nullable", sourceName(&a)))
 		case v.redacted():
-			parts = append(parts, fmt.Sprintf("`%s`", a.File))
+			parts = append(parts, sourceName(&a))
 		default:
-			parts = append(parts, fmt.Sprintf("`%s` sets `%s`", a.File, FormatCompact(a.Value, 40)))
+			parts = append(parts, fmt.Sprintf("%s sets `%s`", sourceName(&a), FormatCompact(a.Value, 40)))
 		}
 	}
 	if v.HasDefault && winner != "default" {

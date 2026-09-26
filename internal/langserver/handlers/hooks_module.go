@@ -13,9 +13,10 @@ import (
 	"github.com/opentofu/tofu-ls/internal/langserver/notifier"
 	"github.com/opentofu/tofu-ls/internal/langserver/session"
 	"github.com/opentofu/tofu-ls/internal/state"
+	"github.com/opentofu/tofu-ls/internal/staticval"
 )
 
-func updateDiagnostics(features *Features, dNotifier *diagnostics.Notifier) notifier.Hook {
+func updateDiagnostics(features *Features, dNotifier *diagnostics.Notifier, inputs *staticval.InputsStore) notifier.Hook {
 	return func(ctx context.Context, changes state.Changes) error {
 		if changes.Diagnostics {
 			path, err := notifier.RecordPathFromContext(ctx)
@@ -28,6 +29,7 @@ func updateDiagnostics(features *Features, dNotifier *diagnostics.Notifier) noti
 
 			diags.Extend(features.Modules.Diagnostics(path))
 			diags.Extend(features.Variables.Diagnostics(path))
+			extendVarFileDiags(features, inputs, path, diags)
 
 			dNotifier.PublishHCLDiags(ctx, path, diags)
 		}

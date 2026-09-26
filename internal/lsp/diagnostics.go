@@ -126,4 +126,6 @@ const (
 	CodeUnusedLocal              = "unused-local"
 	CodeUnusedDataSource         = "unused-data-source"
 	CodeInterpolationOnly        = "interpolation-only"
+	CodeValidationFailed         = "validation-failed"
+	CodeConditionFailed          = "condition-failed"
 )

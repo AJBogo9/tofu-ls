@@ -61,22 +61,64 @@ func (f *ModulesFeature) didOpen(ctx context.Context, dir document.DirHandle, la
 		}
 	}
 
+	// a -var-file file chosen for a module above, opened on its own
+	ids = append(ids, f.revalidateChoosing(ctx, path)...)
+
 	// Schedule jobs if state entry exists
 	hasModuleRecord := f.Store.Exists(path)
 	if !hasModuleRecord {
 		return ids, nil
 	}
 
-	return f.decodeModule(ctx, dir, false, true)
+	moduleIds, err := f.decodeModule(ctx, dir, false, true)
+	return append(ids, moduleIds...), err
 }
 
 func (f *ModulesFeature) didChange(ctx context.Context, dir document.DirHandle) (job.IDs, error) {
+	// a -var-file file chosen for a module in a directory above
+	ids := f.revalidateChoosing(ctx, dir.Path())
+
 	hasModuleRecord := f.Store.Exists(dir.Path())
 	if !hasModuleRecord {
-		return job.IDs{}, nil
+		return ids, nil
 	}
 
-	return f.decodeModule(ctx, dir, true, true)
+	moduleIds, err := f.decodeModule(ctx, dir, true, true)
+	return append(ids, moduleIds...), err
+}
+
+// revalidateChoosing decodes again the modules that chose a -var-file
+// file in dir, whose static values and diagnostics depend on it.
+func (f *ModulesFeature) revalidateChoosing(ctx context.Context, dir string) job.IDs {
+	ids := make(job.IDs, 0)
+	for _, modDir := range f.inputs.Selecting(dir) {
+		if modDir == dir {
+			continue
+		}
+		modIds, err := f.Revalidate(ctx, modDir)
+		if err != nil {
+			f.logger.Printf("decoding %q for its -var-file in %q failed: %s", modDir, dir, err)
+		}
+		ids = append(ids, modIds...)
+	}
+	return ids
+}
+
+// Revalidate decodes and validates the module in dir again, for example
+// after its -var-file choice changed. A module chosen by the client is
+// indexed even when none of its files is open, so that the diagnostics
+// of its -var-file files appear.
+func (f *ModulesFeature) Revalidate(ctx context.Context, dir string) (job.IDs, error) {
+	if !f.Store.Exists(dir) {
+		fi, err := os.Stat(dir)
+		if err != nil || !fi.IsDir() {
+			return job.IDs{}, nil
+		}
+		if err := f.Store.AddIfNotExists(dir); err != nil {
+			return job.IDs{}, err
+		}
+	}
+	return f.decodeModule(ctx, document.DirHandleFromPath(dir), true, true)
 }
 
 func (f *ModulesFeature) didChangeWatched(ctx context.Context, rawPath string, changeType protocol.FileChangeType, isDir bool) (job.IDs, error) {
@@ -138,6 +180,8 @@ func (f *ModulesFeature) didChangeWatched(ctx context.Context, rawPath string, c
 		} else {
 			docHandle := document.HandleFromPath(rawPath)
 			dir = docHandle.Dir
+			// a -var-file file chosen for a module above, changed on disk
+			ids = append(ids, f.revalidateChoosing(ctx, dir.Path())...)
 		}
 
 		// Check if the there are open documents for the path and the
@@ -379,7 +423,7 @@ func (f *ModulesFeature) decodeModule(ctx context.Context, dir document.DirHandl
 					Dir: dir,
 					Func: func(ctx context.Context) error {
 						return jobs.SemanticValidation(ctx, f.fs, f.Store, f.rootFeature,
-							f.stateStore.ProviderSchemas, dir.Path(), validationOptions)
+							f.stateStore.ProviderSchemas, dir.Path(), validationOptions, f.inputsSource())
 					},
 					Type:        op.OpTypeSemanticValidation.String(),
 					DependsOn:   semanticDeps,

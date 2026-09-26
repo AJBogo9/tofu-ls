@@ -35,6 +35,7 @@ func cmdHandlers(svc *service) cmd.Handlers {
 		cmd.Name("module.graph"):     cmdHandler.ModuleGraphHandler,
 		cmd.Name("module.opentofu"):  cmdHandler.TofuVersionRequestHandler,
 		cmd.Name("module.tofu"):      removedHandler("use module.opentofu instead"),
+		cmd.Name("values.inputs"):    svc.valuesInputsHandler,
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"github.com/opentofu/tofu-ls/internal/job"
 	"github.com/opentofu/tofu-ls/internal/settings"
 	globalState "github.com/opentofu/tofu-ls/internal/state"
+	"github.com/opentofu/tofu-ls/internal/staticval"
 	globalAst "github.com/opentofu/tofu-ls/internal/tofu/ast"
 	op "github.com/opentofu/tofu-ls/internal/tofu/module/operation"
 )
@@ -30,16 +31,17 @@ import (
 // package checks): duplicate declarations, unresolved references,
 // unknown resource types, variable types, tfvars values, static-only
 // contexts, operand types, installation, unused data sources and
-// interpolation-only templates. The families switched off in opts are
-// skipped.
+// interpolation-only templates, and conditions that fail for static
+// values. The families switched off in opts are skipped.
 //
 // It relies on the parsed files and metadata of the module and of the
 // modules it calls ([LoadModuleMetadata]) and on the provider schemas
 // loaded so far. Its diagnostics include those of the directory's
 // .tfvars files, which it reads from fs, so that they always match the
-// module's current variables.
+// module's current variables, and those of the -var-file files that
+// inputs chose for the module (may be nil), in any directory below it.
 func SemanticValidation(ctx context.Context, fs ReadOnlyFS, modStore *state.ModuleStore, rootFeature fdecoder.RootReader,
-	schemaStore *globalState.ProviderSchemaStore, modPath string, opts settings.ValidationOptions) error {
+	schemaStore *globalState.ProviderSchemaStore, modPath string, opts settings.ValidationOptions, inputs staticval.InputsSource) error {
 	mod, err := modStore.ModuleRecordByPath(modPath)
 	if err != nil {
 		return err
@@ -90,6 +92,10 @@ func SemanticValidation(ctx context.Context, fs ReadOnlyFS, modStore *state.Modu
 		}
 	}
 	readVarsFiles(fs, modPath, cmod)
+	readChosenVarsFiles(fs, modPath, cmod, inputs)
+	if opts.Conditions {
+		cmod.Values, cmod.ValuesEnv = staticValues(ctx, fs, modStore, rootFeature, modPath, inputs)
+	}
 
 	diags := checks.Run(cmod, opts)
 
@@ -103,6 +109,13 @@ func SemanticValidation(ctx context.Context, fs ReadOnlyFS, modStore *state.Modu
 	}
 	for name, fileDiags := range diags {
 		modDiags[ast.ModFilename(name)] = fileDiags
+	}
+	for name, fileDiags := range mod.ModuleDiagnostics[globalAst.SemanticValidationSource] {
+		if _, ok := modDiags[name]; !ok && len(fileDiags) > 0 {
+			// a file reported before and no longer read, such as a
+			// -var-file file that is no longer chosen
+			modDiags[name] = hcl.Diagnostics{}
+		}
 	}
 
 	return modStore.UpdateModuleDiagnostics(modPath, globalAst.SemanticValidationSource, modDiags)
@@ -131,6 +144,101 @@ func readVarsFiles(fs ReadOnlyFS, modPath string, cmod *checks.Module) {
 		if diags.HasErrors() {
 			cmod.BrokenVars[name] = true
 		}
+	}
+}
+
+// readChosenVarsFiles parses the -var-file files that inputs chose for
+// the module in its subdirectories (those in the directory itself are
+// read already), under their names relative to the module.
+func readChosenVarsFiles(fs ReadOnlyFS, modPath string, cmod *checks.Module, inputs staticval.InputsSource) {
+	if inputs == nil {
+		return
+	}
+	for _, name := range inputs.Inputs(modPath).VarFiles {
+		if !strings.Contains(name, "/") || !strings.HasSuffix(name, ".tfvars") {
+			continue
+		}
+		src, err := fs.ReadFile(filepath.Join(modPath, filepath.FromSlash(name)))
+		if err != nil {
+			continue
+		}
+		f, diags := hclsyntax.ParseConfig(src, name, hcl.InitialPos)
+		if f == nil {
+			continue
+		}
+		cmod.VarsFiles[name] = f
+		if diags.HasErrors() {
+			cmod.BrokenVars[name] = true
+		}
+	}
+}
+
+// staticValues loads the module for static evaluation the way the hover
+// does: with the inputs chosen for it and the modules that call it, which
+// give a child module its values. The environment resolves the modules
+// it calls, local and installed.
+func staticValues(ctx context.Context, fs ReadOnlyFS, modStore *state.ModuleStore, rootFeature fdecoder.RootReader, modPath string, inputs staticval.InputsSource) (*staticval.Evaluator, staticval.Env) {
+	fsys := staticval.WithInputs(fs, inputs)
+	env := staticval.Env{
+		LoadModule: func(dir string) (*staticval.Module, error) {
+			return staticval.LoadModule(fsys, dir)
+		},
+		ModuleDir: func(source string) (string, bool) {
+			addr := tfmod.ParseModuleSourceAddr(source)
+			if addr == nil {
+				return "", false
+			}
+			installed, ok := rootFeature.InstalledModulePath(modPath, addr.String())
+			if !ok {
+				return "", false
+			}
+			if !filepath.IsAbs(installed) {
+				installed = filepath.Join(modPath, installed)
+			}
+			return installed, true
+		},
+	}
+	mod, err := staticval.LoadModule(fsys, modPath)
+	if err != nil {
+		return nil, env
+	}
+	staticval.AddCallers(fsys, mod, maxCallerNesting, indexedCallers(modStore, fsys))
+	return staticval.NewDiagnosticsEvaluatorContext(ctx, mod), env
+}
+
+// maxCallerNesting is how many levels of calling modules are resolved
+// (as for hovers).
+const maxCallerNesting = 3
+
+// indexedCallers returns the indexed modules that call a directory
+// through a local source.
+func indexedCallers(modStore *state.ModuleStore, fsys staticval.FS) func(dir string) []staticval.Caller {
+	return func(dir string) []staticval.Caller {
+		records, err := modStore.List()
+		if err != nil {
+			return nil
+		}
+		var callers []staticval.Caller
+		for _, rec := range records {
+			var parent *staticval.Module
+			for name, mc := range rec.Meta.ModuleCalls {
+				src := mc.RawSourceAddr
+				if !strings.HasPrefix(src, "./") && !strings.HasPrefix(src, "../") {
+					continue
+				}
+				if filepath.Clean(filepath.Join(rec.Path(), src)) != filepath.Clean(dir) {
+					continue
+				}
+				if parent == nil {
+					parent, err = staticval.LoadModule(fsys, rec.Path())
+					if err != nil {
+						break
+					}
+				}
+				callers = append(callers, staticval.Caller{Parent: parent, Name: name})
+			}
+		}
+		return callers
 	}
 }
 

@@ -4,6 +4,7 @@
 package checks
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -22,6 +23,7 @@ import (
 	tfaddr "github.com/opentofu/registry-address"
 	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 	"github.com/opentofu/tofu-ls/internal/settings"
+	"github.com/opentofu/tofu-ls/internal/staticval"
 )
 
 type osFS struct{}
@@ -56,8 +58,15 @@ type checksCase struct {
 	children map[string]map[string]bool
 	// only runs just this check family
 	only string
-	want []string
+	// inputs are the -var-file files and TF_VAR_ variables of the static
+	// values
+	inputs staticval.Inputs
+	want   []string
 }
+
+type fixedInputs staticval.Inputs
+
+func (f fixedInputs) Inputs(string) staticval.Inputs { return staticval.Inputs(f) }
 
 func runChecks(t *testing.T, tc checksCase) []string {
 	t.Helper()
@@ -114,6 +123,12 @@ func runChecks(t *testing.T, tc checksCase) []string {
 	}
 	meta, _ := earlydecoder.LoadModule(dir, mod.Files)
 	mod.Meta = meta
+	fsys := staticval.WithInputs(osFS{}, fixedInputs(tc.inputs))
+	if sm, err := staticval.LoadModule(fsys, dir); err == nil {
+		staticval.AddCallers(fsys, sm, 3, nil)
+		mod.Values = staticval.NewDiagnosticsEvaluatorContext(context.Background(), sm)
+		mod.ValuesEnv = staticval.Env{LoadModule: func(d string) (*staticval.Module, error) { return staticval.LoadModule(fsys, d) }}
+	}
 
 	opts := settings.ValidationOptions{
 		EnableEnhancedValidation: true,
@@ -127,6 +142,7 @@ func runChecks(t *testing.T, tc checksCase) []string {
 		Installation:             true,
 		UnusedDataSources:        true,
 		InterpolationOnly:        true,
+		Conditions:               true,
 	}
 	if tc.only != "" {
 		opts = settings.ValidationOptions{EnableEnhancedValidation: true}
@@ -151,6 +167,8 @@ func runChecks(t *testing.T, tc checksCase) []string {
 			opts.UnusedDataSources = true
 		case "interpolation":
 			opts.InterpolationOnly = true
+		case "conditions":
+			opts.Conditions = true
 		default:
 			t.Fatalf("unknown check family %q", tc.only)
 		}
@@ -1013,6 +1031,207 @@ output "o" { value = [var.b, random_pet.nope.id] }
 	want := []string{
 		`main.tf:2:10-2:15 invalid-type-constraint Invalid type specification`,
 		`main.tf:4:30-4:48 unresolved-reference Reference to undeclared resource`,
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("expected:\n%s\n\ngot:\n%s", strings.Join(want, "\n"), strings.Join(got, "\n"))
+	}
+}
+
+func TestConditions(t *testing.T) {
+	stage := `variable "stage" {
+  type    = string
+  default = "dev"
+  validation {
+    condition     = contains(["dev", "prod"], var.stage)
+    error_message = "The stage must be dev or prod."
+  }
+}
+`
+	testCases := []checksCase{
+		{
+			name: "a tfvars value",
+			only: "conditions",
+			files: map[string]string{
+				"main.tf":          stage,
+				"terraform.tfvars": "stage = \"prd\"\n",
+			},
+			want: []string{`terraform.tfvars:1:9-1:14 validation-failed Invalid value for variable`},
+		},
+		{
+			name: "the default, when it is the value",
+			only: "conditions",
+			files: map[string]string{
+				"main.tf":    strings.Replace(stage, `default = "dev"`, `default = "qa"`, 1),
+				"backend.tf": `terraform {` + "\n" + `  backend "local" {}` + "\n" + `}`,
+			},
+			want: []string{`main.tf:3:13-3:17 validation-failed Invalid value for variable`},
+		},
+		{
+			name: "defaults and conditions on them are silent in a directory that may be a library module",
+			only: "conditions",
+			files: map[string]string{
+				"main.tf": strings.Replace(stage, `default = "dev"`, `default = "qa"`, 1) + `resource "terraform_data" "x" {
+  lifecycle {
+    precondition {
+      condition     = var.stage != "qa"
+      error_message = "callers set the stage"
+    }
+    precondition {
+      condition     = local.fixed == "y"
+      error_message = "whatever the inputs"
+    }
+  }
+}
+locals { fixed = "x" }
+`,
+				".terraform/modules/modules.json": `{"Modules": []}`,
+			},
+			want: []string{`main.tf:16:23-16:41 condition-failed Resource precondition failed`},
+		},
+		{
+			name:   "the selected environment",
+			only:   "conditions",
+			inputs: staticval.Inputs{VarFiles: []string{"envs/prod.tfvars"}},
+			files: map[string]string{
+				"main.tf":          stage,
+				"terraform.tfvars": "stage = \"prd\"\n",
+				"envs/prod.tfvars": "stage = \"prod\"\n",
+			},
+			want: []string{},
+		},
+		{
+			name:   "a TF_VAR_ value, on the declaration",
+			only:   "conditions",
+			inputs: staticval.Inputs{EnvVars: map[string]string{"stage": "qa"}},
+			files: map[string]string{
+				"main.tf":          stage,
+				"terraform.tfvars": "",
+			},
+			want: []string{`main.tf:1:1-1:17 validation-failed Invalid value for variable`},
+		},
+		{
+			name: "module call arguments and conditions",
+			only: "conditions",
+			files: map[string]string{
+				"terraform.tfvars": "",
+				"main.tf": `module "app" {
+  source = "./app"
+  stage  = "qa"
+}
+resource "terraform_data" "x" {
+  lifecycle {
+    precondition {
+      condition     = local.n > 3
+      error_message = "n is too small"
+    }
+  }
+}
+locals { n = 1 }
+check "c" {
+  assert {
+    condition     = local.n > 3
+    error_message = "n is too small"
+  }
+}
+`,
+				"app/main.tf": stage,
+			},
+			want: []string{
+				`main.tf:16:21-16:32 condition-failed Check block assertion failed`,
+				`main.tf:3:12-3:16 validation-failed Invalid value for variable`,
+				`main.tf:8:23-8:34 condition-failed Resource precondition failed`,
+			},
+		},
+		{
+			name: "passing values and unknown conditions are silent",
+			files: map[string]string{
+				"main.tf": stage + `variable "free" {
+  type = string
+  validation {
+    condition     = length(var.free) > 3
+    error_message = "too short"
+  }
+}
+resource "terraform_data" "x" {
+  input = var.stage
+  lifecycle {
+    postcondition {
+      condition     = self.output == "x"
+      error_message = "only known after apply"
+    }
+  }
+}
+`,
+			},
+			want: []string{},
+		},
+		{
+			name: "nothing while a file is broken",
+			only: "conditions",
+			files: map[string]string{
+				"main.tf":   strings.Replace(stage, `default = "dev"`, `default = "qa"`, 1),
+				"broken.tf": `resource "x" {`,
+			},
+			want: []string{},
+		},
+	}
+	testChecks(t, testCases)
+
+	// the published text of one diagnostic of each kind
+	dir := t.TempDir()
+	files := map[string]string{
+		"main.tf": `module "kids" {
+  source   = "./app"
+  for_each = toset(["a", "b"])
+  stage    = each.key
+}
+resource "terraform_data" "x" {
+  for_each = toset(["a", "b"])
+  lifecycle {
+    precondition {
+      condition     = each.key == "a"
+      error_message = "only a"
+    }
+  }
+}
+`,
+		"app/main.tf": stage,
+	}
+	for name, src := range files {
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sm, err := staticval.LoadModule(osFS{}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a -var-file makes it a root module whose values are its inputs
+	sm.VarFiles = []string{"none.tfvars"}
+	f, _ := hclsyntax.ParseConfig([]byte(files["main.tf"]), "main.tf", hcl.InitialPos)
+	mod := &Module{
+		Path:      dir,
+		Files:     map[string]*hcl.File{"main.tf": f},
+		Values:    staticval.NewEvaluator(sm),
+		ValuesEnv: staticval.Env{LoadModule: func(d string) (*staticval.Module, error) { return staticval.LoadModule(osFS{}, d) }},
+	}
+	var got []string
+	for _, d := range Run(mod, settings.ValidationOptions{Conditions: true})["main.tf"] {
+		coded := d.Extra.(ilsp.CodedDiagnostic)
+		line := fmt.Sprintf("%s %s: %s %v", coded.Code, d.Summary, d.Detail, coded.Data)
+		for _, rel := range coded.Related {
+			line += fmt.Sprintf(" [%s %s:%d]", rel.Message, filepath.Base(rel.Range.Filename), rel.Range.Start.Line)
+		}
+		got = append(got, line)
+	}
+	sort.Strings(got)
+	want := []string{
+		`condition-failed Resource precondition failed: terraform_data.x["b"]: only a map[address:terraform_data.x["b"] kind:precondition]`,
+		`validation-failed Invalid value for variable: module.kids["a"], module.kids["b"]: The stage must be dev or prod. map[module:kids variable:stage] [validation rule of var.stage main.tf:4]`,
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("expected:\n%s\n\ngot:\n%s", strings.Join(want, "\n"), strings.Join(got, "\n"))

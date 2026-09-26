@@ -131,6 +131,7 @@ func TestDecodeOptions_validationFamilies(t *testing.T) {
 				Installation:             true,
 				UnusedDataSources:        true,
 				InterpolationOnly:        true,
+				Conditions:               true,
 			},
 		},
 		{
@@ -140,6 +141,7 @@ func TestDecodeOptions_validationFamilies(t *testing.T) {
 					"enableEnhancedValidation": true,
 					"operandTypes":             false,
 					"installation":             false,
+					"conditions":               false,
 				},
 			},
 			ValidationOptions{
@@ -154,6 +156,7 @@ func TestDecodeOptions_validationFamilies(t *testing.T) {
 				Installation:             false,
 				UnusedDataSources:        true,
 				InterpolationOnly:        true,
+				Conditions:               false,
 			},
 		},
 	}
@@ -168,6 +171,49 @@ func TestDecodeOptions_validationFamilies(t *testing.T) {
 				t.Fatalf("unexpected unused keys: %q", out.UnusedKeys)
 			}
 			if diff := cmp.Diff(tc.expected, out.Options.Validation); diff != "" {
+				t.Fatalf("options mismatch: %s", diff)
+			}
+		})
+	}
+}
+
+func TestDecodeOptions_values(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    map[string]interface{}
+		expected Values
+	}{
+		{
+			"nothing chosen by default",
+			map[string]interface{}{},
+			Values{},
+		},
+		{
+			"var files per module and the environment",
+			map[string]interface{}{
+				"values": map[string]interface{}{
+					"varFiles": map[string]interface{}{
+						"file:///work/root": []interface{}{"envs/prod.tfvars", "extra.tfvars"},
+					},
+					"readEnvironment": true,
+				},
+			},
+			Values{
+				VarFiles:        map[string][]string{"file:///work/root": {"envs/prod.tfvars", "extra.tfvars"}},
+				ReadEnvironment: true,
+			},
+		},
+	}
+	for i, tc := range testCases {
+		t.Run(fmt.Sprintf("%d-%s", i, tc.name), func(t *testing.T) {
+			out, err := DecodeOptions(tc.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(out.UnusedKeys) > 0 {
+				t.Fatalf("unexpected unused keys: %q", out.UnusedKeys)
+			}
+			if diff := cmp.Diff(tc.expected, out.Options.Values); diff != "" {
 				t.Fatalf("options mismatch: %s", diff)
 			}
 		})
