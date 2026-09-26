@@ -190,7 +190,8 @@ func initializeResult(ctx context.Context) lsp.InitializeResult {
 			},
 			CodeActionProvider: lsp.CodeActionOptions{
 				CodeActionKinds: ilsp.SupportedCodeActions.AsSlice(),
-				ResolveProvider: false,
+				// refactorings compute their edits when resolved
+				ResolveProvider: true,
 			},
 			DeclarationProvider:        true,
 			DefinitionProvider:         true,

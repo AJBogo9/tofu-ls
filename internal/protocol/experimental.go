@@ -56,3 +56,14 @@ func (cc ExpClientCapabilities) RefreshTofuVersionCommandId() (string, bool) {
 	cmdId, ok := cc["refreshTofuVersionCommandId"].(string)
 	return cmdId, ok
 }
+
+// RenameCommandId is the client command which starts a rename at a
+// position: the arguments are a document URI and an LSP position.
+func (cc ExpClientCapabilities) RenameCommandId() (string, bool) {
+	if cc == nil {
+		return "", false
+	}
+
+	cmdId, ok := cc["renameCommandId"].(string)
+	return cmdId, ok
+}

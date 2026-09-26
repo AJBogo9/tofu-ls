@@ -71,6 +71,9 @@ type Action struct {
 	// Create lists the files (absolute paths) the edits create.
 	Create  []string
 	Command *Command
+	// Resolve, when set, names a refactoring whose edits and command
+	// Resolve computes later; Edits is empty until then.
+	Resolve *Refactoring
 }
 
 // Document is the file an action is requested for.
@@ -153,6 +156,20 @@ type Env struct {
 	// file at path, when it was parsed from src without errors, which
 	// saves parsing it again on every request.
 	ParsedFile func(path string, src []byte) (*hclsyntax.Body, bool)
+	// RenameCommand is the client command which starts a rename at a
+	// position, given the file's URI and an LSP position, or "" when the
+	// client has none.
+	RenameCommand string
+	// FileURI turns a file path into its URI.
+	FileURI func(path string) string
+	// ModuleCallers returns the module blocks which call the module in
+	// dir through a local source; false when they cannot be known.
+	ModuleCallers func(dir string) ([]ModuleCaller, bool)
+	// IndexedCallers is ModuleCallers for the modules indexed so far:
+	// cheap, but it may miss callers.
+	IndexedCallers func(dir string) []ModuleCaller
+	// StaticValue evaluates an expression of the module in dir statically.
+	StaticValue func(dir string, expr hcl.Expression) StaticValue
 }
 
 // parse parses a native syntax file, or takes the server's tree of it.
