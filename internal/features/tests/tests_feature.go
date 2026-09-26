@@ -71,7 +71,10 @@ func (f *TestsFeature) Start(ctx context.Context) {
 	ctx, cancelFunc := context.WithCancel(ctx)
 	f.stopFunc = cancelFunc
 
-	discover := f.eventbus.OnDiscover("feature.tests", nil)
+	// the walker waits until a directory's test files are recorded and
+	// their jobs queued, so that waiting for the queued jobs waits for them
+	discoverDone := make(chan struct{}, 10)
+	discover := f.eventbus.OnDiscover("feature.tests", discoverDone)
 
 	didOpenDone := make(chan struct{}, 10)
 	didOpen := f.eventbus.OnDidOpen("feature.tests", didOpenDone)
@@ -88,6 +91,7 @@ func (f *TestsFeature) Start(ctx context.Context) {
 			case discover := <-discover:
 				// the walker sends no context, and jobs need a document one
 				f.discover(lsctx.WithDocumentContext(ctx, lsctx.Document{}), discover.Path, discover.Files)
+				discoverDone <- struct{}{}
 			case didOpen := <-didOpen:
 				f.didOpen(didOpen.Context, didOpen.Dir, didOpen.LanguageID)
 				didOpenDone <- struct{}{}

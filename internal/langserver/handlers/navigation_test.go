@@ -806,7 +806,7 @@ run "check" {
 func TestRename_refusesModuleOutsideWorkspace(t *testing.T) {
 	// the module lives next to the workspace folder, as in a monorepo
 	// opened at envs/prod: other callers of it cannot be seen
-	shared := filepath.Join(os.TempDir(), "tofu-ls", t.Name()+"-shared")
+	shared := filepath.Join(tempDirRoot(), t.Name()+"-shared")
 	if err := os.MkdirAll(shared, 0o755); err != nil {
 		t.Fatal(err)
 	}

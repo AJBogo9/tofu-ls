@@ -118,6 +118,7 @@ func TestAddEntryEdit(t *testing.T) {
 			"terraform.tf",
 			`terraform {
   required_version = ">= 1.6"
+
   required_providers {
     aws = {
       source = "hashicorp/aws"
@@ -224,7 +225,7 @@ resource "aws_instance" "a" {}
 			if _, ok := tc.files[current]; !ok {
 				current = "main.tf.json"
 			}
-			edit, ok := AddEntryEdit(files, current, "aws", "hashicorp/aws")
+			edit, ok := AddEntryEdit(files, current, "aws", "hashicorp/aws", EntryOptions{})
 			if tc.wantNoTarget {
 				if ok {
 					t.Fatalf("expected no edit, got %#v", edit)
@@ -239,6 +240,171 @@ resource "aws_instance" "a" {}
 			}
 			got := applyEdit(tc.files[edit.Filename], edit)
 			if diff := cmp.Diff(tc.wantText, got); diff != "" {
+				t.Fatalf("unexpected text: %s", diff)
+			}
+		})
+	}
+}
+
+func TestAddEntryEdit_options(t *testing.T) {
+	testCases := []struct {
+		name     string
+		files    map[string]string
+		opts     EntryOptions
+		wantFile string
+		// wantText is the file after the edit, or the new file
+		wantText     string
+		wantNewBlock bool
+		wantCreate   bool
+	}{
+		{
+			"with a version constraint",
+			map[string]string{
+				"main.tf": "resource \"aws_instance\" \"a\" {}\n",
+				"versions.tf": `terraform {
+  required_providers {
+    random = {
+      source = "hashicorp/random"
+    }
+  }
+}
+`,
+			},
+			EntryOptions{Version: "~> 6.0"},
+			"versions.tf",
+			`terraform {
+  required_providers {
+    random = {
+      source = "hashicorp/random"
+    }
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+`,
+			false, false,
+		},
+		{
+			"the terraform block of versions.tf before an earlier one",
+			map[string]string{
+				"main.tf":     "resource \"aws_instance\" \"a\" {}\n",
+				"backend.tf":  "terraform {\n  backend \"local\" {}\n}\n",
+				"versions.tf": "terraform {\n  required_version = \">= 1.6\"\n}\n",
+			},
+			EntryOptions{},
+			"versions.tf",
+			`terraform {
+  required_version = ">= 1.6"
+
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+    }
+  }
+}
+`,
+			false, false,
+		},
+		{
+			"first in an empty terraform block: no blank line",
+			map[string]string{
+				"main.tf":     "resource \"aws_instance\" \"a\" {}\n",
+				"versions.tf": "terraform {\n}\n",
+			},
+			EntryOptions{},
+			"versions.tf",
+			`terraform {
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+    }
+  }
+}
+`,
+			false, false,
+		},
+		{
+			"a new versions.tf, for a client which can create it",
+			map[string]string{
+				"main.tf": "resource \"aws_instance\" \"a\" {}\n",
+			},
+			EntryOptions{CreateVersionsFile: true},
+			"versions.tf",
+			`terraform {
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+    }
+  }
+}
+`,
+			true, true,
+		},
+		{
+			"versions.tf which ends with a blank line",
+			map[string]string{
+				"main.tf":     "resource \"aws_instance\" \"a\" {}\n",
+				"versions.tf": "# versions\n\n",
+			},
+			EntryOptions{CreateVersionsFile: true},
+			"versions.tf",
+			`# versions
+
+terraform {
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+    }
+  }
+}
+`,
+			true, false,
+		},
+		{
+			"the line endings of the file",
+			map[string]string{
+				"main.tf": "terraform {\r\n  required_providers {\r\n  }\r\n}\r\n\r\nresource \"aws_instance\" \"a\" {}\r\n",
+			},
+			EntryOptions{},
+			"main.tf",
+			"terraform {\r\n  required_providers {\r\n    aws = {\r\n      source = \"hashicorp/aws\"\r\n    }\r\n  }\r\n}\r\n\r\nresource \"aws_instance\" \"a\" {}\r\n",
+			false, false,
+		},
+		{
+			"a new terraform block at the top of the current file",
+			map[string]string{
+				"main.tf": "resource \"aws_instance\" \"a\" {}\n",
+			},
+			EntryOptions{Version: "~> 6.0"},
+			"main.tf",
+			`terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+resource "aws_instance" "a" {}
+`,
+			true, false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			edit, ok := AddEntryEdit(parseFiles(t, tc.files), "main.tf", "aws", "hashicorp/aws", tc.opts)
+			if !ok {
+				t.Fatal("expected an edit")
+			}
+			if edit.Filename != tc.wantFile || edit.NewBlock != tc.wantNewBlock || edit.Create != tc.wantCreate {
+				t.Fatalf("edit of %q (new block %v, create %v), want %q (%v, %v)",
+					edit.Filename, edit.NewBlock, edit.Create, tc.wantFile, tc.wantNewBlock, tc.wantCreate)
+			}
+			if diff := cmp.Diff(tc.wantText, applyEdit(tc.files[edit.Filename], edit)); diff != "" {
 				t.Fatalf("unexpected text: %s", diff)
 			}
 		})

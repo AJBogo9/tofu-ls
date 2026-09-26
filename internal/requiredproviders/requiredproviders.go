@@ -247,19 +247,40 @@ type Edit struct {
 	// Range is empty for an insertion.
 	Range   hcl.Range
 	NewText string
+	// NewBlock tells that the edit adds a terraform block, rather than an
+	// entry or a required_providers block to an existing one.
+	NewBlock bool
+	// Create tells that the edit creates Filename, which does not exist.
+	Create bool
+}
+
+// EntryOptions are the optional parts of AddEntryEdit.
+type EntryOptions struct {
+	// Version is the entry's version constraint, left out when empty.
+	Version string
+	// CreateVersionsFile puts a new terraform block into a new versions.tf
+	// instead of at the top of the current file, for a client which can
+	// create files.
+	CreateVersionsFile bool
 }
 
 // AddEntryEdit returns the edit which declares a required_providers entry
 // for name with the given source:
 //
 //   - into a required_providers block, in the first file which has one;
-//   - else as a new required_providers block, in the first terraform block;
+//   - else as a new required_providers block, in the terraform block of
+//     versions.tf or else in the first terraform block, separated from
+//     the arguments before it by a blank line;
 //   - else as a new terraform block at the end of versions.tf when there
-//     is such a file, or at the top of currentFile.
+//     is such a file, in a new versions.tf (opts.CreateVersionsFile) or
+//     at the top of currentFile.
 //
-// The text is formatted as tofu fmt formats it. JSON files are left alone.
-func AddEntryEdit(files map[string]*hcl.File, currentFile, name, source string) (Edit, bool) {
-	var firstTerraform *hclsyntax.Block
+// The text is formatted as tofu fmt formats it, with the file's line
+// endings. JSON files are left alone.
+func AddEntryEdit(files map[string]*hcl.File, currentFile, name, source string, opts EntryOptions) (Edit, bool) {
+	entry := entryLines(name, source, opts.Version)
+
+	var firstTerraform, versionsTerraform *hclsyntax.Block
 	var firstTerraformFile string
 	for _, filename := range sortedNames(files) {
 		body, ok := files[filename].Body.(*hclsyntax.Body)
@@ -273,37 +294,63 @@ func AddEntryEdit(files map[string]*hcl.File, currentFile, name, source string) 
 			if firstTerraform == nil {
 				firstTerraform, firstTerraformFile = tf, filename
 			}
+			if versionsTerraform == nil && filename == "versions.tf" {
+				versionsTerraform = tf
+			}
 			for _, rp := range tf.Body.Blocks {
 				if rp.Type == "required_providers" {
 					src := files[filename].Bytes
-					return appendToBlock(filename, src, rp, entryLines(name, source)), true
+					return withNewlines(appendToBlock(filename, src, rp, entry, false), src), true
 				}
 			}
 		}
 	}
 
+	if versionsTerraform != nil {
+		firstTerraform, firstTerraformFile = versionsTerraform, "versions.tf"
+	}
 	if firstTerraform != nil {
 		src := files[firstTerraformFile].Bytes
-		lines := append([]string{"required_providers {"}, indentLines(entryLines(name, source))...)
+		lines := append([]string{"required_providers {"}, indentLines(entry)...)
 		lines = append(lines, "}")
-		return appendToBlock(firstTerraformFile, src, firstTerraform, lines), true
+		return withNewlines(appendToBlock(firstTerraformFile, src, firstTerraform, lines, true), src), true
 	}
 
-	block := terraformBlockText(name, source)
+	block := terraformBlockText(entry)
 	if f, ok := files["versions.tf"]; ok {
-		return appendToFile("versions.tf", f.Bytes, block), true
+		return withNewlines(appendToFile("versions.tf", f.Bytes, block), f.Bytes), true
+	}
+	if opts.CreateVersionsFile {
+		pos := hcl.InitialPos
+		return Edit{
+			Filename: "versions.tf",
+			Range:    hcl.Range{Filename: "versions.tf", Start: pos, End: pos},
+			NewText:  block,
+			NewBlock: true,
+			Create:   true,
+		}, true
 	}
 	f, ok := files[currentFile]
 	if !ok || strings.HasSuffix(currentFile, ".json") {
 		return Edit{}, false
 	}
-	return prependToFile(currentFile, f, block), true
+	return withNewlines(prependToFile(currentFile, f, block), f.Bytes), true
 }
 
-func entryLines(name, source string) []string {
+// entryLines is the entry for name, with the version constraint unless it
+// is empty.
+func entryLines(name, source, version string) []string {
+	if version == "" {
+		return []string{
+			fmt.Sprintf("%s = {", name),
+			fmt.Sprintf("  source = %q", source),
+			"}",
+		}
+	}
 	return []string{
 		fmt.Sprintf("%s = {", name),
-		fmt.Sprintf("  source = %q", source),
+		fmt.Sprintf("  source  = %q", source),
+		fmt.Sprintf("  version = %q", version),
 		"}",
 	}
 }
@@ -316,16 +363,26 @@ func indentLines(lines []string) []string {
 	return indented
 }
 
-func terraformBlockText(name, source string) string {
+func terraformBlockText(entry []string) string {
 	lines := []string{"terraform {", "  required_providers {"}
-	lines = append(lines, indentLines(indentLines(entryLines(name, source)))...)
+	lines = append(lines, indentLines(indentLines(entry))...)
 	lines = append(lines, "  }", "}")
 	return strings.Join(lines, "\n") + "\n"
 }
 
+// withNewlines converts the line endings of the edit's text to those of
+// src, the text of the file it edits.
+func withNewlines(e Edit, src []byte) Edit {
+	if bytes.Contains(src, []byte("\r\n")) {
+		e.NewText = strings.ReplaceAll(e.NewText, "\n", "\r\n")
+	}
+	return e
+}
+
 // appendToBlock inserts lines, indented one level below block, as the last
-// items of block's body.
-func appendToBlock(filename string, src []byte, block *hclsyntax.Block, lines []string) Edit {
+// items of block's body. A nested block (isBlock) is separated by a blank
+// line from the body's content before it.
+func appendToBlock(filename string, src []byte, block *hclsyntax.Block, lines []string, isBlock bool) Edit {
 	indent := lineIndent(src, block.TypeRange.Start.Byte) + "  "
 	var text strings.Builder
 	for _, l := range lines {
@@ -356,10 +413,17 @@ func appendToBlock(filename string, src []byte, block *hclsyntax.Block, lines []
 	lineStart := bytes.LastIndexByte(src[:closeRng.Start.Byte], '\n') + 1
 	if strings.TrimSpace(string(src[lineStart:closeRng.Start.Byte])) == "" {
 		pos := hcl.Pos{Line: closeRng.Start.Line, Column: 1, Byte: lineStart}
+		newText := text.String()
+		if isBlock && lineStart > 0 {
+			prev := strings.TrimSpace(string(src[bytes.LastIndexByte(src[:lineStart-1], '\n')+1 : lineStart-1]))
+			if prev != "" && !strings.HasSuffix(prev, "{") {
+				newText = "\n" + newText
+			}
+		}
 		return Edit{
 			Filename: filename,
 			Range:    hcl.Range{Filename: filename, Start: pos, End: pos},
-			NewText:  text.String(),
+			NewText:  newText,
 		}
 	}
 	// `x = 1 }`: break the line before the brace, dropping the spaces
@@ -369,10 +433,14 @@ func appendToBlock(filename string, src []byte, block *hclsyntax.Block, lines []
 		start.Byte--
 		start.Column--
 	}
+	breakText := "\n"
+	if isBlock {
+		breakText = "\n\n"
+	}
 	return Edit{
 		Filename: filename,
 		Range:    hcl.Range{Filename: filename, Start: start, End: closeRng.Start},
-		NewText:  "\n" + text.String() + lineIndent(src, block.TypeRange.Start.Byte),
+		NewText:  breakText + text.String() + lineIndent(src, block.TypeRange.Start.Byte),
 	}
 }
 
@@ -388,18 +456,21 @@ func lineIndent(src []byte, offset int) string {
 
 func appendToFile(filename string, src []byte, text string) Edit {
 	end := endPos(src)
+	// one blank line between the content before and the block
 	prefix := ""
-	trimmed := bytes.TrimRight(src, " \t\r\n")
-	if len(trimmed) > 0 {
+	trimmed := bytes.TrimRight(bytes.ReplaceAll(src, []byte("\r\n"), []byte("\n")), " \t")
+	switch {
+	case len(bytes.TrimSpace(trimmed)) == 0, bytes.HasSuffix(trimmed, []byte("\n\n")):
+	case bytes.HasSuffix(trimmed, []byte("\n")):
 		prefix = "\n"
-		if !bytes.HasSuffix(src, []byte("\n")) {
-			prefix = "\n\n"
-		}
+	default:
+		prefix = "\n\n"
 	}
 	return Edit{
 		Filename: filename,
 		Range:    hcl.Range{Filename: filename, Start: end, End: end},
 		NewText:  prefix + text,
+		NewBlock: true,
 	}
 }
 
@@ -440,6 +511,7 @@ func prependToFile(filename string, f *hcl.File, text string) Edit {
 		Filename: filename,
 		Range:    hcl.Range{Filename: filename, Start: pos, End: pos},
 		NewText:  text + "\n",
+		NewBlock: true,
 	}
 }
 

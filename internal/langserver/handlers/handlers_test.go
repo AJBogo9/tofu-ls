@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -267,6 +269,25 @@ func validTfMockCalls() []*mock.Call {
 
 // TempDir creates a temporary directory containing the test name, as well any
 // additional nested dir specified, use slash "/" to nest for more complex
+// tempDirRoot is the parent of every TempDir of this test process. It is
+// private to the process: under a fixed os.TempDir()/tofu-ls, two test
+// binaries running at once (two suites, or copies under stress) wrote
+// into and removed each other's workspaces, and a test then found its
+// module half deleted.
+var tempDirRoot = sync.OnceValue(func() string {
+	dir, err := os.MkdirTemp("", "tofu-ls-")
+	if err != nil {
+		panic(err)
+	}
+	return dir
+})
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	os.RemoveAll(tempDirRoot())
+	os.Exit(code)
+}
+
 // setups
 //
 //	ex: TempDir(t, "a/b", "c")
@@ -276,7 +297,7 @@ func validTfMockCalls() []*mock.Call {
 //
 // The returned filehandler is the parent tmp dir
 func TempDir(t *testing.T, nested ...string) document.DirHandle {
-	tmpDir := filepath.Join(os.TempDir(), "tofu-ls", t.Name())
+	tmpDir := filepath.Join(tempDirRoot(), t.Name())
 	err := os.MkdirAll(tmpDir, 0755)
 	if err != nil && !os.IsExist(err) {
 		t.Fatal(err)
@@ -296,6 +317,31 @@ func TempDir(t *testing.T, nested ...string) document.DirHandle {
 	}
 
 	return document.DirHandleFromPath(tmpDir)
+}
+
+func TestTempDir_privateToProcess(t *testing.T) {
+	if os.Getenv("TOFU_LS_TEMPDIR_OTHER_PROCESS") != "" {
+		// the same test in a second test binary, as when two suites run
+		// at once: it creates and then removes its own workspace
+		TempDir(t)
+		return
+	}
+
+	dir := TempDir(t)
+	file := filepath.Join(dir.Path(), "main.tf")
+	if err := os.WriteFile(file, []byte("locals {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := osexec.Command(os.Args[0], "-test.run=^TestTempDir_privateToProcess$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "TOFU_LS_TEMPDIR_OTHER_PROCESS=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("second process: %s\n%s", err, out)
+	}
+
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("the second process removed this one's workspace: %s", err)
+	}
 }
 
 func InitPluginCache(t *testing.T, dir string) {

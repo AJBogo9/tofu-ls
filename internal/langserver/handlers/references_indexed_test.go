@@ -4,12 +4,14 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/opentofu/tofu-ls/internal/document"
 	"github.com/opentofu/tofu-ls/internal/langserver"
+	lsp "github.com/opentofu/tofu-ls/internal/protocol"
 )
 
 // span is the location of text on the 0-based line of a file (ASCII
@@ -104,6 +106,34 @@ func TestReferences_indexedAndSplatUses(t *testing.T) {
 				span(t, tmpDir, files, "main.tf", 33, `var.names`),
 			},
 		},
+		{
+			// the uses of the call, not also those of its output
+			"on the call name in a use of an output",
+			at{"main.tf", 30, "child", 1, 1},
+			[]string{
+				span(t, tmpDir, files, "main.tf", 29, `module.child[*].name`),
+				span(t, tmpDir, files, "main.tf", 30, `module.child[0].name`),
+			},
+		},
+		{
+			"on the call name in a use of an output of a for_each call",
+			at{"main.tf", 27, "kids", 1, 1},
+			[]string{
+				span(t, tmpDir, files, "main.tf", 27, `module.kids["a"].name`),
+				span(t, tmpDir, files, "main.tf", 28, `module.kids[var.names[1]].name`),
+			},
+		},
+		{
+			// the uses of the output, from both calls
+			"on the output name in a use of it",
+			at{"main.tf", 30, "name", 1, 1},
+			[]string{
+				span(t, tmpDir, files, "main.tf", 27, `module.kids["a"].name`),
+				span(t, tmpDir, files, "main.tf", 28, `module.kids[var.names[1]].name`),
+				span(t, tmpDir, files, "main.tf", 29, `module.child[*].name`),
+				span(t, tmpDir, files, "main.tf", 30, `module.child[0].name`),
+			},
+		},
 	}
 	for i, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -154,6 +184,38 @@ func TestDefinition_indexedUses(t *testing.T) {
 				}`, i+3, strings.Join(tc.expected, ", ")))
 		})
 	}
+}
+
+func TestDocumentHighlight_moduleCallInOutputUse(t *testing.T) {
+	files := map[string]string{"main.tf": indexedMainTf, "kid/main.tf": indexedKidTf}
+	ls, tmpDir, stop := startNavigationServerOpening(t, files, "{}", "kid/main.tf")
+	defer stop()
+
+	highlight := func(line int, text string, kind int) string {
+		l := strings.Split(files["main.tf"], "\n")[line]
+		i := strings.Index(l, text)
+		if i < 0 {
+			t.Fatalf("%q not on main.tf:%d", text, line)
+		}
+		return fmt.Sprintf(`{"range": {"start": {"line": %d, "character": %d}, "end": {"line": %d, "character": %d}}, "kind": %d}`,
+			line, i, line, i+len(text), kind)
+	}
+	// on the call name: the call and its uses, not the uses of the
+	// output through the other call (module.kids)
+	ls.CallAndExpectResponse(t, &langserver.CallRequest{
+		Method: "textDocument/documentHighlight",
+		ReqParams: fmt.Sprintf(`{
+			"textDocument": {"uri": "%s/main.tf"},
+			"position": %s
+		}`, tmpDir.URI, at{"main.tf", 30, "child", 1, 1}.position(t, files))}, fmt.Sprintf(`{
+			"jsonrpc": "2.0",
+			"id": 4,
+			"result": [%s]
+		}`, strings.Join([]string{
+		highlight(20, `child`, 3),
+		highlight(29, `module.child[*].name`, 2),
+		highlight(30, `module.child[0].name`, 2),
+	}, ", ")))
 }
 
 func TestDefinitionAndReferences_variableInBackend(t *testing.T) {
@@ -290,4 +352,92 @@ resource "terraform_data" "a" {
 				}`, i+3, tc.expected))
 		})
 	}
+}
+
+func TestDefinition_locationLinksOnEmojiLines(t *testing.T) {
+	// emoji before each reference and before each target: LSP counts an
+	// emoji as two UTF-16 code units, HCL as one column (and four bytes)
+	files := map[string]string{
+		"main.tf":      "locals {\n  /* \U0001F680 */ sky = \"\U0001F319 ${var.moon}\"\n}\n\noutput \"o\" {\n  value = \"\U0001F680 ${local.sky} ${var.moon}\"\n}\n",
+		"variables.tf": "/* \U0001F680 */ variable \"moon\" {\n  default = \"\U0001F319\"\n}\n",
+	}
+	rng := func(startLine, startChar, endLine, endChar uint32) lsp.Range {
+		return lsp.Range{Start: lsp.Position{Line: startLine, Character: startChar}, End: lsp.Position{Line: endLine, Character: endChar}}
+	}
+	ptr := func(r lsp.Range) *lsp.Range { return &r }
+	linkCaps := `{"textDocument": {"definition": {"linkSupport": true}, "declaration": {"linkSupport": true}}}`
+
+	testCases := []struct {
+		name     string
+		caps     string
+		method   string
+		pos      lsp.Position
+		expected string
+	}{
+		{
+			"local in the same file",
+			linkCaps, "textDocument/definition", lsp.Position{Line: 5, Character: 22},
+			mustJSON(t, []lsp.LocationLink{{
+				OriginSelectionRange: ptr(rng(5, 16, 5, 25)),
+				TargetURI:            "main.tf",
+				TargetRange:          rng(1, 11, 1, 33),
+				TargetSelectionRange: rng(1, 11, 1, 14),
+			}}),
+		},
+		{
+			"variable in another file, which is not open",
+			linkCaps, "textDocument/definition", lsp.Position{Line: 5, Character: 33},
+			mustJSON(t, []lsp.LocationLink{{
+				OriginSelectionRange: ptr(rng(5, 29, 5, 37)),
+				TargetURI:            "variables.tf",
+				TargetRange:          rng(0, 9, 2, 1),
+				TargetSelectionRange: rng(0, 9, 0, 24),
+			}}),
+		},
+		{
+			"declaration",
+			linkCaps, "textDocument/declaration", lsp.Position{Line: 5, Character: 33},
+			mustJSON(t, []lsp.LocationLink{{
+				OriginSelectionRange: ptr(rng(5, 29, 5, 37)),
+				TargetURI:            "variables.tf",
+				TargetRange:          rng(0, 9, 2, 1),
+				TargetSelectionRange: rng(0, 9, 0, 24),
+			}}),
+		},
+		{
+			"locations, for a client without link support",
+			"{}", "textDocument/definition", lsp.Position{Line: 5, Character: 22},
+			mustJSON(t, []lsp.Location{{URI: "main.tf", Range: rng(1, 11, 1, 33)}}),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ls, dir, stop := startCodeActionServer(t, files, tc.caps, "main.tf")
+			defer stop()
+
+			result, err := ls.call(&langserver.CallRequest{
+				Method: tc.method,
+				ReqParams: fmt.Sprintf(`{
+					"textDocument": {"uri": "%s/main.tf"},
+					"position": %s
+				}`, dir.URI, mustJSON(t, tc.pos))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// the URIs are relative to the module in the expectations
+			got := strings.ReplaceAll(string(result), dir.URI+"/", "")
+			if got != tc.expected {
+				t.Fatalf("expected\n%s\ngot\n%s", tc.expected, got)
+			}
+		})
+	}
+}
+
+func mustJSON(t *testing.T, v interface{}) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
