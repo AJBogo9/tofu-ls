@@ -126,7 +126,9 @@ func declareVariable(env Env, doc Document, name string, ty cty.Type) []Action {
 	}
 
 	rel := filepath.ToSlash(relTo(dir, target))
-	action := Action{Preferred: true}
+	// not preferred: the name may be a typo of a declared variable, which
+	// an auto fix must not turn into a second declaration
+	action := Action{}
 	if create {
 		action.Title = fmt.Sprintf("Declare variable %q in a new %s", name, rel)
 		action.Create = []string{target}

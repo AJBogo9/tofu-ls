@@ -195,8 +195,8 @@ variable "one" {}
 			diag := Diagnostic{Code: CodeUnresolvedReference, Data: tc.data, Range: tc.files.rangeOf(t, tc.doc, tc.needle, 1)}
 			actions := QuickFixes(env, tc.files.doc(tc.doc), diag)
 			a := expectAction(t, tc.files, actions, tc.title, tc.edits, tc.want)
-			if !a.Preferred {
-				t.Errorf("expected a preferred fix")
+			if a.Preferred {
+				t.Errorf("declaring a variable must not be preferred: the name may be a typo")
 			}
 			if tc.creates == "" && len(a.Create) > 0 {
 				t.Errorf("unexpected file creation: %v", a.Create)

@@ -20,6 +20,8 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/zclconf/go-cty/cty"
+
+	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 )
 
 // Kinds of the actions, as LSP code action kinds.
@@ -28,18 +30,18 @@ const (
 	KindRefactorRewrite = "refactor.rewrite"
 )
 
-// Diagnostic codes the quick fixes answer (the diagnostic code contract
-// shared with the diagnostics).
+// Diagnostic codes the quick fixes answer, as the diagnostics publish
+// them (see the Code constants in internal/lsp).
 const (
-	CodeUnusedVariable           = "unused-variable"
-	CodeUnusedLocal              = "unused-local"
-	CodeUnusedDataSource         = "unused-data-source"
-	CodeUnresolvedReference      = "unresolved-reference"
-	CodeTfvarsUndeclaredVariable = "tfvars-undeclared-variable"
-	CodeMissingRequiredAttribute = "missing-required-attribute"
-	CodeModuleNotInstalled       = "module-not-installed"
-	CodeProviderNotInstalled     = "provider-not-installed"
-	CodeInterpolationOnly        = "interpolation-only"
+	CodeUnusedVariable           = ilsp.CodeUnusedVariable
+	CodeUnusedLocal              = ilsp.CodeUnusedLocal
+	CodeUnusedDataSource         = ilsp.CodeUnusedDataSource
+	CodeUnresolvedReference      = ilsp.CodeUnresolvedReference
+	CodeTfvarsUndeclaredVariable = ilsp.CodeTfvarsUndeclared
+	CodeMissingRequiredAttribute = ilsp.CodeMissingRequiredAttribute
+	CodeModuleNotInstalled       = ilsp.CodeModuleNotInstalled
+	CodeProviderNotInstalled     = ilsp.CodeProviderNotInstalled
+	CodeInterpolationOnly        = ilsp.CodeInterpolationOnly
 )
 
 // Edit replaces Range of the file at the absolute path File with NewText.
