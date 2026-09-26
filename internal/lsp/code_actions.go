@@ -7,6 +7,7 @@ package lsp
 
 import (
 	"sort"
+	"strings"
 
 	lsp "github.com/opentofu/tofu-ls/internal/protocol"
 )
@@ -14,6 +15,14 @@ import (
 const (
 	// SourceFormatAllTofu is a OpenTofu specific format code action.
 	SourceFormatAllTofu = "source.formatAll.opentofu"
+
+	// QuickFix actions fix the diagnostics sent with the request. They show
+	// in the lightbulb menu.
+	QuickFix = "quickfix"
+
+	// RefactorRewrite actions rewrite the expression at the cursor, such
+	// as element(list, i) as list[i].
+	RefactorRewrite = "refactor.rewrite"
 )
 
 type CodeActions map[lsp.CodeActionKind]bool
@@ -37,6 +46,8 @@ var (
 	// files to be formatted, but not terraform files (or vice versa).
 	SupportedCodeActions = CodeActions{
 		SourceFormatAllTofu: true,
+		QuickFix:            true,
+		RefactorRewrite:     true,
 	}
 )
 
@@ -62,4 +73,20 @@ func (ca CodeActions) Only(only []lsp.CodeActionKind) CodeActions {
 	}
 
 	return wanted
+}
+
+// Wants tells whether a request whose context asks for the kinds only
+// wants actions of kind. No kinds ask for every kind the lightbulb shows
+// (no source actions), and a kind asks for its sub-kinds: refactor asks
+// for refactor.rewrite.
+func Wants(only []lsp.CodeActionKind, kind lsp.CodeActionKind) bool {
+	if len(only) == 0 {
+		return !strings.HasPrefix(string(kind), "source")
+	}
+	for _, o := range only {
+		if o == kind || strings.HasPrefix(string(kind), string(o)+".") {
+			return true
+		}
+	}
+	return false
 }
