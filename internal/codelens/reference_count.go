@@ -49,6 +49,12 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 		// but not here, where we present it to the user.
 		dedupedTargets := make(map[hcl.Range]reference.Targets, 0)
 		for _, refTarget := range refTargets {
+			if isIterationTarget(refTarget) {
+				// each.key, each.value and count.index: a lens on for_each
+				// or count counts the block's own iteration symbols, which
+				// says little and adds a line to the block
+				continue
+			}
 			rng := *refTarget.RangePtr
 			if _, ok := dedupedTargets[rng]; !ok {
 				dedupedTargets[rng] = make(reference.Targets, 0)
@@ -116,7 +122,7 @@ func ReferenceCount(showReferencesCmdId string) lang.CodeLensFunc {
 			lenses = append(lenses, lang.CodeLens{
 				Range: rng,
 				Command: lang.Command{
-					Title: getTitle("reference", "references", originCount) + checkedNonUseSuffix(seen, refTargets[0].Addr.String(), unusedInSyntax),
+					Title: lensTitle(seen, refTargets[0].Addr.String(), unusedInSyntax),
 					ID:    showReferencesCmdId,
 					Arguments: []lang.CommandArgument{
 						Position(ilsp.HCLPosToLSP(hclPos)),
@@ -167,41 +173,65 @@ func originKind(po decoder.PathOrigin, target reference.Target, path lang.Path) 
 	return originUse
 }
 
-// nonUseSuffix explains a count whose references are none of them uses
-// in expressions, e.g. " (tfvars only)", so that it agrees with a faded
-// "declared but not used" name.
-func nonUseSuffix(kinds map[originKey]string) string {
-	if len(kinds) == 0 {
+// splitTitle counts a variable's references by kind when some of them
+// are not uses in expressions: "6 uses · 12 callers", "0 uses · 1 tfvars".
+// Uses inside the module come first, then the module calls that set it,
+// tfvars assignments and its own validation. It returns "" when
+// every reference is a use. The parts add up to what a click lists, and
+// "0 uses" agrees with a faded "declared but not used" name.
+func splitTitle(kinds map[originKey]string) string {
+	counts := make(map[string]int)
+	for _, kind := range kinds {
+		counts[kind]++
+	}
+	if counts[originUse] == len(kinds) {
 		return ""
 	}
-	found := make(map[string]bool)
-	for _, kind := range kinds {
-		if kind == originUse {
-			return ""
-		}
-		found[kind] = true
+	parts := []string{getTitle("use", "uses", counts[originUse])}
+	if n := counts[originModuleArg]; n > 0 {
+		parts = append(parts, getTitle("caller", "callers", n))
 	}
-	names := make([]string, 0, len(found))
-	for _, kind := range []string{originVarsFile, originModuleArg, originValidation} {
-		if found[kind] {
-			names = append(names, kind)
-		}
+	if n := counts[originVarsFile]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d tfvars", n))
 	}
-	if len(names) == 1 {
-		return " (" + names[0] + " only)"
+	if n := counts[originValidation]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d in validation", n))
 	}
-	return " (" + strings.Join(names, ", ") + " only)"
+	return strings.Join(parts, " · ")
 }
 
-// checkedNonUseSuffix is nonUseSuffix, left out when the module's syntax
-// uses the symbol (addr) somewhere the decoder does not see, such as a
-// block without a schema: " (tfvars only)" would then be wrong.
-func checkedNonUseSuffix(kinds map[originKey]string, addr string, unused func() map[string]bool) string {
-	suffix := nonUseSuffix(kinds)
-	if suffix == "" || unused()[addr] {
-		return suffix
+// lensTitle is the title of a lens whose target (addr) has the origins
+// kinds: "3 references", or splitTitle's counts by kind. The split is left
+// out when it would say "0 uses" but the module's syntax uses the symbol
+// somewhere the decoder does not see, such as a block without a schema.
+func lensTitle(kinds map[originKey]string, addr string, unused func() map[string]bool) string {
+	total := getTitle("reference", "references", len(kinds))
+	split := splitTitle(kinds)
+	if split == "" {
+		return total
 	}
-	return ""
+	for _, kind := range kinds {
+		if kind == originUse {
+			return split
+		}
+	}
+	if unused()[addr] {
+		return split
+	}
+	return total
+}
+
+// isIterationTarget reports whether a target is each.key, each.value or
+// count.index, which for_each and count declare for their block.
+func isIterationTarget(t reference.Target) bool {
+	if len(t.Addr) > 0 || len(t.LocalAddr) == 0 {
+		return false
+	}
+	switch t.LocalAddr[0].String() {
+	case "each", "count":
+		return true
+	}
+	return false
 }
 
 // originKey identifies an origin across the targets of one lens.

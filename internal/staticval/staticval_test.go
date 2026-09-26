@@ -343,9 +343,9 @@ func TestInlayHints(t *testing.T) {
 		got = append(got, h.Ref+" "+h.Label)
 	}
 	for _, w := range []string{
-		`var.project = "demo"`,
-		`local.prefix = "demo-prod"`,
-		`var.network.zones = ["a", "b"]`,
+		"var.project " + ValueHintPrefix + `"demo"`,
+		"local.prefix " + ValueHintPrefix + `"demo-prod"`,
+		"var.network.zones " + ValueHintPrefix + `["a", "b"]`,
 	} {
 		found := false
 		for _, g := range got {

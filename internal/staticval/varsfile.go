@@ -49,7 +49,7 @@ func (ev *Evaluator) VarsFileHover(filename string, file *hcl.File, pos hcl.Pos)
 		fmt.Fprintf(&b, "```hcl\ntype = %s\n```\n\n", typeBlock)
 	}
 	if v.Description != "" {
-		b.WriteString(v.Description)
+		b.WriteString(shortDescription(v.Description))
 		b.WriteString("\n\n")
 	}
 	var flags []string

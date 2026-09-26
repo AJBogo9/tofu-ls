@@ -10,10 +10,11 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	ilsp "github.com/opentofu/tofu-ls/internal/lsp"
 	lsp "github.com/opentofu/tofu-ls/internal/protocol"
+	"github.com/opentofu/tofu-ls/internal/staticval"
 )
 
 // TextDocumentInlayHint shows the statically known value after var and
-// local references (opentofu.inlayHints.values).
+// local references, or of whole expressions (opentofu.inlayHints.values).
 func (svc *service) TextDocumentInlayHint(ctx context.Context, params lsp.InlayHintParams) ([]lsp.InlayHint, error) {
 	hints := []lsp.InlayHint{}
 	if !svc.inlayHints.Values {
@@ -54,7 +55,14 @@ func (svc *service) TextDocumentInlayHint(ctx context.Context, params lsp.InlayH
 	if err != nil {
 		return nil, err
 	}
-	for _, h := range ev.InlayHints(doc.Filename, rng, svc.inlayHints.MaxLength) {
+	opts := staticval.InlayOptions{Policy: staticval.InlayInformative, MaxLength: svc.inlayHints.MaxLength}
+	if svc.inlayHints.ValuePolicy == "all" {
+		opts.Policy = staticval.InlayAll
+	} else {
+		// a library module's defaults are placeholders its callers replace
+		opts.HideDefaults = staticval.IsLibraryRoot(svc.fs, ev.Module(), svc.indexedCallers)
+	}
+	for _, h := range ev.InlayHintsWith(doc.Filename, rng, opts) {
 		pos := ilsp.HCLPosToLSPInText(h.Pos, doc.Text)
 		hints = append(hints, lsp.InlayHint{
 			Position: &pos,

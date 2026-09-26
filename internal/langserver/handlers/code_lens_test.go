@@ -329,7 +329,7 @@ variable "instances" {
 						}
 					},
 					"command": {
-						"title": "1 reference (module arguments only)",
+						"title": "0 uses · 1 caller",
 						"command": "test.id",
 						"arguments": [
 							{
@@ -354,7 +354,7 @@ variable "instances" {
 						}
 					},
 					"command": {
-						"title": "1 reference (module arguments only)",
+						"title": "0 uses · 1 caller",
 						"command": "test.id",
 						"arguments": [
 							{
@@ -379,7 +379,7 @@ variable "instances" {
 						}
 					},
 					"command": {
-						"title": "1 reference (module arguments only)",
+						"title": "0 uses · 1 caller",
 						"command": "test.id",
 						"arguments": [
 							{
