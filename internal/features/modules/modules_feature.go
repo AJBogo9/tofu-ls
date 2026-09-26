@@ -182,14 +182,17 @@ func (f *ModulesFeature) ModuleInputs(modPath string) (map[string]tfmod.Variable
 
 func (f *ModulesFeature) AppendCompletionHooks(srvCtx context.Context, decoderContext decoder.DecoderContext) {
 	h := hooks.Hooks{
-		ModStore:       f.Store,
-		RegistryClient: f.registryClient,
-		Logger:         f.logger,
+		ModStore:        f.Store,
+		RegistryClient:  f.registryClient,
+		Logger:          f.logger,
+		ProviderSchemas: f.stateStore.ProviderSchemas,
 	}
 
 	decoderContext.CompletionHooks["CompleteLocalModuleSources"] = h.LocalModuleSources
 	decoderContext.CompletionHooks["CompleteRegistryModuleSources"] = h.RegistryModuleSources
 	decoderContext.CompletionHooks["CompleteRegistryModuleVersions"] = h.RegistryModuleVersions
+	decoderContext.CompletionHooks["CompleteProviderSources"] = h.ProviderSources
+	decoderContext.CompletionHooks["CompleteProviderVersions"] = h.ProviderVersions
 }
 
 func (f *ModulesFeature) Diagnostics(path string) diagnostics.Diagnostics {

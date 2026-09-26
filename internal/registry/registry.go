@@ -25,6 +25,13 @@ type Client struct {
 	BaseRegistryURL string
 	Timeout         time.Duration
 	httpClient      *http.Client
+
+	// UserAgent identifies the language server in the requests made for
+	// provider completion.
+	UserAgent string
+	// cache holds the responses for provider completion. It is shared by
+	// copies of the client.
+	cache *responseCache
 }
 
 func NewClient() Client {
@@ -37,5 +44,6 @@ func NewClient() Client {
 		BaseRegistryURL: registryBaseURL,
 		Timeout:         defaultTimeout,
 		httpClient:      client,
+		cache:           newResponseCache(),
 	}
 }

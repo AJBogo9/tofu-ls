@@ -110,6 +110,10 @@ func (f *ModulesFeature) loadModuleMetadata(ctx context.Context, dir document.Di
 		Dir: dir,
 		Func: func(ctx context.Context) error {
 			err := jobs.ParseModuleConfiguration(ctx, f.fs, f.Store, path)
+			if err == nil && parseValidationOptions.EnableEnhancedValidation {
+				// needs only the parsed files too
+				f.checkPathFiles(ctx, path)
+			}
 			if err == nil && parseValidationOptions.UnusedSymbols {
 				// as in decodeModule, which will not parse again
 				return jobs.UnusedSymbols(ctx, f.fs, f.Store, path)
@@ -158,4 +162,26 @@ func (f *ModulesFeature) callsModule(mod *state.ModuleRecord, modPath string) bo
 		}
 	}
 	return false
+}
+
+// checkPathFiles warns about file function paths in the module at path
+// that name no file. A module that an indexed module calls resolves
+// paths relative to the root module from its caller's directory, so
+// those are left alone there.
+func (f *ModulesFeature) checkPathFiles(ctx context.Context, path string) {
+	isCalled := func() bool {
+		records, err := f.Store.List()
+		if err != nil {
+			return true
+		}
+		for _, mod := range records {
+			if mod.Path() != path && f.callsModule(mod, path) {
+				return true
+			}
+		}
+		return false
+	}
+	if err := jobs.MissingPathFiles(ctx, f.fs, f.Store, path, isCalled); err != nil {
+		f.logger.Printf("checking file paths of %q failed: %s", path, err)
+	}
 }

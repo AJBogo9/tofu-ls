@@ -12,6 +12,7 @@ import (
 	"log"
 
 	"github.com/opentofu/tofu-ls/internal/registry"
+	globalState "github.com/opentofu/tofu-ls/internal/state"
 
 	"github.com/opentofu/tofu-ls/internal/features/modules/state"
 )
@@ -20,4 +21,8 @@ type Hooks struct {
 	ModStore       *state.ModuleStore
 	RegistryClient registry.Client
 	Logger         *log.Logger
+
+	// ProviderSchemas, when set, offers the providers with a schema
+	// (installed or bundled) as provider sources.
+	ProviderSchemas *globalState.ProviderSchemaStore
 }

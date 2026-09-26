@@ -141,6 +141,24 @@ func (lsm *langServerMock) Call(t T, cr *CallRequest) *rawResponse {
 	return r
 }
 
+// CallWithError is Call for a request that may fail: an error response is
+// returned rather than failing the test.
+func (lsm *langServerMock) CallWithError(t T, cr *CallRequest) (*rawResponse, error) {
+	rsp, err := lsm.client.Call(context.Background(), cr.Method, json.RawMessage(cr.ReqParams))
+	if err != nil {
+		return nil, err
+	}
+	b, err := rsp.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &rawResponse{}
+	if err := r.UnmarshalJSON(b); err != nil {
+		t.Fatal(err)
+	}
+	return r, nil
+}
+
 func (lsm *langServerMock) CallAndExpectResponse(t *testing.T, cr *CallRequest, expectRaw string) {
 	rsp := lsm.Call(t, cr)
 

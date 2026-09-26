@@ -22,6 +22,8 @@ const (
 	// SemanticValidationSource reports the checks which need the whole
 	// module (duplicates, references, types, tfvars, installation).
 	SemanticValidationSource
+	// FilePathsSource reports file function paths that name no file.
+	FilePathsSource
 )
 
 func (d DiagnosticSource) String() string {

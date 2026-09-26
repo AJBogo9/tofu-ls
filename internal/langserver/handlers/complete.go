@@ -50,8 +50,21 @@ func (svc *service) TextDocumentComplete(ctx context.Context, params lsp.Complet
 		return list, err
 	}
 
+	if pathList, ok := svc.filePathCompletion(doc, pos); ok {
+		return pathList, nil
+	}
+
 	svc.logger.Printf("Looking for candidates at %q -> %#v", doc.Filename, pos)
 	candidates, err := d.CompletionAtPos(ctx, doc.Filename, pos)
 	svc.logger.Printf("received candidates: %#v", candidates)
-	return ilsp.ToCompletionList(candidates, cc.TextDocument), err
+	commands, entry := svc.providerCompletionExtras(ctx, doc, pos, &candidates)
+	if entry && err != nil {
+		// a half-typed required_providers entry breaks its block
+		candidates.IsComplete, err = true, nil
+	}
+	list = ilsp.ToCompletionList(candidates, cc.TextDocument)
+	for i, command := range commands {
+		list.Items[i].Command = command
+	}
+	return list, err
 }

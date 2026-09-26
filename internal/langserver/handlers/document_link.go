@@ -40,7 +40,9 @@ func (svc *service) TextDocumentLink(ctx context.Context, params lsp.DocumentLin
 	}
 
 	links, err := d.LinksInFile(doc.Filename)
-	if err != nil {
+	// paths of files that functions read need no schema
+	links = append(links, svc.filePathLinks(ctx, doc)...)
+	if err != nil && len(links) == 0 {
 		return nil, err
 	}
 

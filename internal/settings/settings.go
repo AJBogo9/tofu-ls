@@ -67,6 +67,12 @@ type RenameOptions struct {
 	AddMovedBlock bool `mapstructure:"addMovedBlock" default:"true"`
 }
 
+type CompletionOptions struct {
+	// AddRequiredProviders declares the provider of a completed resource
+	// or data source type in required_providers when it is not there yet.
+	AddRequiredProviders bool `mapstructure:"addRequiredProviders" default:"true"`
+}
+
 type DiagnosticsOptions struct {
 	// UnusedSymbols reports variables and locals which nothing references.
 	UnusedSymbols bool `mapstructure:"unusedSymbols" default:"true"`
@@ -100,6 +106,7 @@ type Options struct {
 	Validation ValidationOptions `mapstructure:"validation"`
 
 	Rename      RenameOptions      `mapstructure:"rename"`
+	Completion  CompletionOptions  `mapstructure:"completion"`
 	Diagnostics DiagnosticsOptions `mapstructure:"diagnostics"`
 	InlayHints  InlayHints         `mapstructure:"inlayHints"`
 
